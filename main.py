@@ -2,6 +2,7 @@ import numpy as np
 import cv2
 from rgbd_feed import DemoApp
 from vision_analyzer import VisionAnalyzer
+from aruco_transformer import ArucoTransformer
 
 class KinematicsApp(DemoApp):
     def __init__(self):
@@ -16,6 +17,10 @@ class KinematicsApp(DemoApp):
         
         # Current RGB frame for vision analysis
         self.current_rgb = None
+        
+        # ArUco transformer and pose
+        self.aruco_transformer = None
+        self.aruco_pose = None
         
     def pixel_to_3d_position(self, u, v, depth_value):
         """
@@ -109,6 +114,10 @@ class KinematicsApp(DemoApp):
                         if pos_3d:
                             X, Y, Z = pos_3d
                             print(f"Manual D({x},{y})->RGB({rgb_x},{rgb_y}) -> Depth: {depth_value:.3f}m, 3D: ({X:.3f},{Y:.3f},{Z:.3f})")
+                            if self.aruco_pose and self.aruco_transformer:
+                                rel = self.aruco_transformer.transform_to_aruco_frame(np.array([X, Y, Z]), self.aruco_pose)
+                                if rel is not None:
+                                    print(f"[ArUco] Relative to marker: ({rel[0]:.3f},{rel[1]:.3f},{rel[2]:.3f})")
                     else:
                         print(f"Depth at D({x},{y}): {depth_value:.3f} meters")
         
@@ -443,6 +452,18 @@ class KinematicsApp(DemoApp):
             # Store intrinsic matrix for 3D calculations
             self.intrinsic_mat = intrinsic_mat
 
+            # Initialize ArUco transformer once we have intrinsics
+            if self.aruco_transformer is None and self.intrinsic_mat is not None:
+                self.aruco_transformer = ArucoTransformer(camera_matrix=self.intrinsic_mat,
+                                                            dist_coeffs=np.zeros((4,1), dtype=np.float32),
+                                                            marker_size=0.05)
+                print("[ArUco] Transformer initialized")
+            
+            # Detect ArUco marker each frame (ID 0 by default)
+            if self.aruco_transformer and self.current_rgb is not None:
+                rgb_for_aruco = cv2.cvtColor(self.current_rgb, cv2.COLOR_BGR2RGB)
+                self.aruco_pose = self.aruco_transformer.detect_aruco_marker(rgb_for_aruco, 0)
+
             # Postprocess frames
             if self.session.get_device_type() == self.DEVICE_TYPE__TRUEDEPTH:
                 depth = cv2.flip(depth, 1)
@@ -492,6 +513,10 @@ class KinematicsApp(DemoApp):
                                 print(f"Depth Pixel: ({depth_x}, {depth_y})")
                                 print(f"Depth: {depth_value:.3f}m")
                                 print(f"3D Position: ({X:.3f}, {Y:.3f}, {Z:.3f})m")
+                                if self.aruco_pose and self.aruco_transformer:
+                                    rel = self.aruco_transformer.transform_to_aruco_frame(np.array([X, Y, Z]), self.aruco_pose)
+                                    if rel is not None:
+                                        print(f"Relative to marker: ({rel[0]:.3f}, {rel[1]:.3f}, {rel[2]:.3f})m")
                                 print(f"Confidence: {result.get('confidence', 'N/A')}")
                                 
                                 # Store RGB coordinates for overlay (since RGB display uses RGB coords)
@@ -514,6 +539,10 @@ class KinematicsApp(DemoApp):
             # Apply vision overlay if in vision mode
             if self.vision_mode and self.vision_result:
                 rgb = self.vision_analyzer.create_visualization(rgb, self.vision_result)
+            
+            # Overlay ArUco marker visualization on RGB
+            if self.aruco_pose and self.aruco_transformer:
+                rgb = self.aruco_transformer.create_visualization(rgb, self.aruco_pose, self.last_mouse_pos if self.last_mouse_pos else None)
             
             # Add mode indicator to RGB display
             mode_text = f"Mode: {'AI VISION' if self.vision_mode else 'MANUAL'}"

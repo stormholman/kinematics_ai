@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-ArUco Marker Coordinate Transformer
-Transforms target object positions from camera coordinates to ArUco marker coordinates
-Uses ArUco marker ID 0 as reference frame for robotic manipulation
+Standalone ArUco Marker Detector and Reference Frame Tracker
+Reads RGB data from RGBD camera and detects ArUco markers as reference frames
 """
 
 import cv2
 import numpy as np
+from record3d import Record3DStream
+from threading import Event
 from typing import Optional, Tuple, Dict, Any
 import json
 
@@ -29,11 +30,32 @@ class ArucoTransformer:
         self.marker_size = marker_size
         
         # Initialize ArUco detector
-        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
+        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_ARUCO_ORIGINAL)
         self.aruco_params = cv2.aruco.DetectorParameters()
+        
+        # Optimize parameters for better detection
+        self.aruco_params.adaptiveThreshWinSizeMin = 3
+        self.aruco_params.adaptiveThreshWinSizeMax = 23
+        self.aruco_params.adaptiveThreshWinSizeStep = 10
+        self.aruco_params.adaptiveThreshConstant = 7
+        self.aruco_params.minMarkerPerimeterRate = 0.1
+        self.aruco_params.maxMarkerPerimeterRate = 0.8
+        self.aruco_params.polygonalApproxAccuracyRate = 0.05
+        self.aruco_params.minCornerDistanceRate = 0.1
+        self.aruco_params.minDistanceToBorder = 3
+        self.aruco_params.minOtsuStdDev = 5.0
+        self.aruco_params.perspectiveRemovePixelPerCell = 4
+        self.aruco_params.perspectiveRemoveIgnoredMarginPerCell = 0.13
+        self.aruco_params.maxErroneousBitsInBorderRate = 0.2
+        self.aruco_params.minMarkerDistanceRate = 0.05
+        self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        self.aruco_params.cornerRefinementWinSize = 5
+        self.aruco_params.cornerRefinementMaxIterations = 30
+        self.aruco_params.cornerRefinementMinAccuracy = 0.1
+        
         self.aruco_detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
         
-        # Default camera parameters (replace with actual calibration)
+        # Default camera parameters (will be updated from RGBD stream)
         if self.camera_matrix is None:
             self.camera_matrix = np.array([[800, 0, 320],
                                          [0, 800, 240],
@@ -55,13 +77,12 @@ class ArucoTransformer:
         """
         try:
             # Convert to grayscale for ArUco detection
-            gray = cv2.cvtColor(rgb_image, cv2.COLOR_BGR2GRAY)
+            gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
             
-            # Detect ArUco markers
+            # Detect markers
             corners, ids, _ = self.aruco_detector.detectMarkers(gray)
             
             if ids is None or len(ids) == 0:
-                print(f"[ArUco] No ArUco markers detected")
                 return None
             
             # Find target marker ID
@@ -72,7 +93,6 @@ class ArucoTransformer:
                     break
             
             if target_idx is None:
-                print(f"[ArUco] Marker ID {target_id} not found")
                 return None
             
             # Create 3D object points for ArUco marker corners
@@ -92,7 +112,6 @@ class ArucoTransformer:
             )
             
             if not success:
-                print(f"[ArUco] Failed to estimate pose for marker {target_id}")
                 return None
             
             # Convert rotation vector to rotation matrix
@@ -103,9 +122,6 @@ class ArucoTransformer:
             transformation_matrix[:3, :3] = rotation_matrix
             transformation_matrix[:3, 3] = tvec.flatten()
             
-            # Convert rotation vector to Euler angles (rx, ry, rz)
-            rx, ry, rz = self.rotation_vector_to_euler(rvec.flatten())
-            
             result = {
                 'marker_id': target_id,
                 'found': True,
@@ -114,78 +130,58 @@ class ArucoTransformer:
                     'y': float(tvec.flatten()[1]),
                     'z': float(tvec.flatten()[2])
                 },
-                'rotation': {
-                    'rx': float(rx),
-                    'ry': float(ry),
-                    'rz': float(rz)
-                },
-                'rotation_vector': rvec.flatten().tolist(),
-                'translation_vector': tvec.flatten().tolist(),
-                'rotation_matrix': rotation_matrix.tolist(),
                 'transformation_matrix': transformation_matrix.tolist(),
-                'corners': corners[target_idx][0].tolist()
+                'corners': corners[target_idx][0].tolist(),
+                'rotation_matrix': rotation_matrix.tolist(),
+                'rotation_vector': rvec.flatten().tolist()
             }
             
-            print(f"[ArUco] Marker {target_id} detected at position ({tvec.flatten()[0]:.3f}, {tvec.flatten()[1]:.3f}, {tvec.flatten()[2]:.3f})")
             return result
             
         except Exception as e:
             print(f"[ArUco] Error detecting marker: {e}")
             return None
     
-    def pixel_to_3d_point(self, pixel_coords: Tuple[int, int], depth_image: np.ndarray) -> Optional[np.ndarray]:
+    def get_target_relative_to_aruco(self, rgb_image: np.ndarray, target_3d_camera: np.ndarray, aruco_id: int = 0) -> Optional[Dict[str, Any]]:
         """
-        Convert pixel coordinates to 3D point in camera frame using depth
+        Get target object position relative to ArUco marker
         
         Args:
-            pixel_coords: (x, y) pixel coordinates
-            depth_image: Depth image (same dimensions as RGB)
+            rgb_image: RGB image from camera
+            target_3d_camera: 3D point in camera coordinates [x, y, z]
+            aruco_id: ArUco marker ID to use as reference (default 0)
             
         Returns:
-            3D point in camera coordinates [x, y, z] or None if invalid
+            Dictionary with relative position information or None if failed
         """
         try:
-            x_pixel, y_pixel = pixel_coords
-            
-            # Get depth value at pixel location
-            if depth_image is None:
-                print("[ArUco] No depth image provided")
-                return None
-                
-            if (y_pixel >= depth_image.shape[0] or x_pixel >= depth_image.shape[1] or 
-                y_pixel < 0 or x_pixel < 0):
-                print(f"[ArUco] Pixel coordinates ({x_pixel}, {y_pixel}) out of bounds")
+            # Detect ArUco marker
+            aruco_pose = self.detect_aruco_marker(rgb_image, aruco_id)
+            if aruco_pose is None:
                 return None
             
-            depth = depth_image[y_pixel, x_pixel]
-            
-            # Handle different depth image formats
-            if depth == 0:
-                print(f"[ArUco] Invalid depth at pixel ({x_pixel}, {y_pixel})")
+            # Transform target point to ArUco frame
+            target_3d_aruco = self.transform_to_aruco_frame(target_3d_camera, aruco_pose)
+            if target_3d_aruco is None:
                 return None
             
-            # Convert depth to meters if needed (assuming depth in mm)
-            if depth > 10:  # Likely in mm
-                depth = depth / 1000.0
+            # Prepare result
+            result = {
+                'success': True,
+                'aruco_marker': aruco_pose,
+                'target_position_camera': target_3d_camera.tolist(),
+                'target_position_aruco': target_3d_aruco.tolist(),
+                'relative_position': {
+                    'x': float(target_3d_aruco[0]),
+                    'y': float(target_3d_aruco[1]),
+                    'z': float(target_3d_aruco[2])
+                }
+            }
             
-            # Convert pixel to 3D point using camera intrinsics
-            fx = self.camera_matrix[0, 0]
-            fy = self.camera_matrix[1, 1]
-            cx = self.camera_matrix[0, 2]
-            cy = self.camera_matrix[1, 2]
-            
-            # 3D point in camera frame
-            x_cam = (x_pixel - cx) * depth / fx
-            y_cam = (y_pixel - cy) * depth / fy
-            z_cam = depth
-            
-            point_3d = np.array([x_cam, y_cam, z_cam])
-            print(f"[ArUco] 3D point in camera frame: ({x_cam:.3f}, {y_cam:.3f}, {z_cam:.3f})")
-            
-            return point_3d
+            return result
             
         except Exception as e:
-            print(f"[ArUco] Error converting pixel to 3D: {e}")
+            print(f"[ArUco] Error getting relative position: {e}")
             return None
     
     def transform_to_aruco_frame(self, point_camera_frame: np.ndarray, aruco_pose: Dict[str, Any]) -> Optional[np.ndarray]:
@@ -213,94 +209,73 @@ class ArucoTransformer:
             point_aruco_homogeneous = T_aruco_to_cam @ point_homogeneous
             point_aruco_frame = point_aruco_homogeneous[:3]
             
-            print(f"[ArUco] Point in ArUco frame: ({point_aruco_frame[0]:.3f}, {point_aruco_frame[1]:.3f}, {point_aruco_frame[2]:.3f})")
-            
             return point_aruco_frame
             
         except Exception as e:
             print(f"[ArUco] Error transforming to ArUco frame: {e}")
             return None
     
-    def get_target_relative_to_aruco(self, rgb_image: np.ndarray, depth_image: np.ndarray, 
-                                   target_pixel: Tuple[int, int], aruco_id: int = 0) -> Optional[Dict[str, Any]]:
+    def pixel_to_3d_point(self, u: int, v: int, depth: float) -> Optional[np.ndarray]:
         """
-        Get target object position relative to ArUco marker
+        Convert pixel coordinates and depth to 3D point in camera frame
         
         Args:
-            rgb_image: RGB image from camera
-            depth_image: Depth image from camera
-            target_pixel: (x, y) pixel coordinates of target object
-            aruco_id: ArUco marker ID to use as reference (default 0)
+            u: x pixel coordinate
+            v: y pixel coordinate
+            depth: depth value in meters
             
         Returns:
-            Dictionary with relative position information or None if failed
+            3D point in camera coordinates [x, y, z] or None if failed
         """
         try:
-            # Detect ArUco marker
-            aruco_pose = self.detect_aruco_marker(rgb_image, aruco_id)
-            if aruco_pose is None:
-                return None
+            # Extract intrinsic parameters
+            fx = self.camera_matrix[0, 0]
+            fy = self.camera_matrix[1, 1]
+            cx = self.camera_matrix[0, 2]
+            cy = self.camera_matrix[1, 2]
             
-            # Convert target pixel to 3D point in camera frame
-            target_3d_camera = self.pixel_to_3d_point(target_pixel, depth_image)
-            if target_3d_camera is None:
-                return None
+            # Convert to 3D coordinates using pinhole camera model
+            X = (u - cx) * depth / fx
+            Y = (v - cy) * depth / fy
+            Z = depth
             
-            # Transform target point to ArUco frame
-            target_3d_aruco = self.transform_to_aruco_frame(target_3d_camera, aruco_pose)
-            if target_3d_aruco is None:
-                return None
-            
-            # Prepare result
-            result = {
-                'success': True,
-                'aruco_marker': aruco_pose,
-                'target_pixel': list(target_pixel),
-                'target_position_camera': target_3d_camera.tolist(),
-                'target_position_aruco': target_3d_aruco.tolist(),
-                'relative_position': {
-                    'x': float(target_3d_aruco[0]),
-                    'y': float(target_3d_aruco[1]),
-                    'z': float(target_3d_aruco[2])
-                }
-            }
-            
-            print(f"[ArUco] Target relative to marker: x={target_3d_aruco[0]:.3f}m, y={target_3d_aruco[1]:.3f}m, z={target_3d_aruco[2]:.3f}m")
-            
-            return result
+            return np.array([X, Y, Z])
             
         except Exception as e:
-            print(f"[ArUco] Error getting relative position: {e}")
+            print(f"[ArUco] Error converting pixel to 3D point: {e}")
             return None
     
     def rotation_vector_to_euler(self, rvec: np.ndarray) -> Tuple[float, float, float]:
         """
-        Convert rotation vector to Euler angles (rx, ry, rz)
+        Convert rotation vector to Euler angles (roll, pitch, yaw)
         
         Args:
-            rvec: Rotation vector from cv2.aruco.estimatePoseSingleMarkers
+            rvec: Rotation vector from solvePnP
             
         Returns:
-            Tuple of Euler angles (rx, ry, rz) in radians
+            Tuple of (roll, pitch, yaw) in radians
         """
-        # Convert rotation vector to rotation matrix
-        rotation_matrix, _ = cv2.Rodrigues(rvec)
-        
-        # Extract Euler angles from rotation matrix (ZYX convention)
-        sy = np.sqrt(rotation_matrix[0, 0]**2 + rotation_matrix[1, 0]**2)
-        
-        singular = sy < 1e-6
-        
-        if not singular:
-            rx = np.arctan2(rotation_matrix[2, 1], rotation_matrix[2, 2])
-            ry = np.arctan2(-rotation_matrix[2, 0], sy)
-            rz = np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0])
-        else:
-            rx = np.arctan2(-rotation_matrix[1, 2], rotation_matrix[1, 1])
-            ry = np.arctan2(-rotation_matrix[2, 0], sy)
-            rz = 0
-        
-        return rx, ry, rz
+        try:
+            rotation_matrix, _ = cv2.Rodrigues(rvec.flatten())
+            
+            # Extract Euler angles
+            sy = np.sqrt(rotation_matrix[0, 0] * rotation_matrix[0, 0] + rotation_matrix[1, 0] * rotation_matrix[1, 0])
+            singular = sy < 1e-6
+            
+            if not singular:
+                x = np.arctan2(rotation_matrix[2, 1], rotation_matrix[2, 2])
+                y = np.arctan2(-rotation_matrix[2, 0], sy)
+                z = np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0])
+            else:
+                x = np.arctan2(-rotation_matrix[1, 2], rotation_matrix[1, 1])
+                y = np.arctan2(-rotation_matrix[2, 0], sy)
+                z = 0
+            
+            return (x, y, z)
+            
+        except Exception as e:
+            print(f"[ArUco] Error converting rotation vector to Euler angles: {e}")
+            return (0.0, 0.0, 0.0)
     
     def create_visualization(self, rgb_image: np.ndarray, aruco_pose: Dict[str, Any] = None, 
                            target_pixel: Tuple[int, int] = None) -> np.ndarray:
@@ -331,11 +306,27 @@ class ArucoTransformer:
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             
             # Draw coordinate axes
-            if 'rotation_vector' in aruco_pose and 'translation_vector' in aruco_pose:
-                rvec = np.array(aruco_pose['rotation_vector'])
-                tvec = np.array(aruco_pose['translation_vector'])
-                cv2.drawFrameAxes(vis_image, self.camera_matrix, self.dist_coeffs, 
-                                rvec.flatten(), tvec.flatten(), self.marker_size * 0.5)
+            if 'transformation_matrix' in aruco_pose:
+                T = np.array(aruco_pose['transformation_matrix'])
+                origin = T[:3, 3]
+                
+                # Project origin to image coordinates
+                if self.camera_matrix is not None:
+                    fx = self.camera_matrix[0, 0]
+                    fy = self.camera_matrix[1, 1]
+                    cx = self.camera_matrix[0, 2]
+                    cy = self.camera_matrix[1, 2]
+                    
+                    # Project 3D point to 2D
+                    if origin[2] > 0:
+                        u = int(fx * origin[0] / origin[2] + cx)
+                        v = int(fy * origin[1] / origin[2] + cy)
+                        
+                        # Draw coordinate axes
+                        axis_length = 50
+                        cv2.line(vis_image, (u, v), (u + axis_length, v), (255, 0, 0), 2)  # X-axis (red)
+                        cv2.line(vis_image, (u, v), (u, v + axis_length), (0, 255, 0), 2)  # Y-axis (green)
+                        cv2.line(vis_image, (u, v), (u + axis_length//2, v + axis_length//2), (0, 0, 255), 2)  # Z-axis (blue)
         
         # Draw target object
         if target_pixel:
@@ -346,58 +337,291 @@ class ArucoTransformer:
         
         return vis_image
 
-# Test function
-def test_aruco_transformer():
-    """Test the ArUco transformer with sample data"""
-    print("Testing ArUco Transformer")
-    print("=" * 50)
+class StandaloneArucoDetector:
+    """
+    Standalone ArUco detector that reads RGB data from RGBD camera
+    """
     
-    transformer = ArucoTransformer()
-    
-    # Create test image with ArUco marker
-    test_image = np.ones((480, 640, 3), dtype=np.uint8) * 255
-    
-    # Generate ArUco marker
-    marker = cv2.aruco.generateImageMarker(transformer.aruco_dict, 0, 200)
-    
-    # Place marker in image
-    y_start, y_end = 100, 300
-    x_start, x_end = 200, 400
-    test_image[y_start:y_end, x_start:x_end] = cv2.cvtColor(marker, cv2.COLOR_GRAY2BGR)
-    
-    # Create mock depth image
-    depth_image = np.ones((480, 640), dtype=np.float32) * 1.0  # 1 meter depth
-    
-    # Test detection
-    aruco_pose = transformer.detect_aruco_marker(test_image, 0)
-    
-    if aruco_pose:
-        print("\nArUco Detection Results:")
-        print(json.dumps({k: v for k, v in aruco_pose.items() 
-                         if k not in ['rotation_matrix', 'transformation_matrix']}, indent=2))
+    def __init__(self):
+        self.event = Event()
+        self.session = None
+        self.DEVICE_TYPE__TRUEDEPTH = 0
+        self.DEVICE_TYPE__LIDAR = 1
         
-        # Test coordinate transformation
-        target_pixel = (320, 240)  # Center of image
-        result = transformer.get_target_relative_to_aruco(test_image, depth_image, target_pixel, 0)
+        # ArUco transformer
+        self.aruco_transformer = None
+        self.camera_matrix = None
         
-        if result:
-            print("\nTransformation Results:")
-            print(json.dumps({k: v for k, v in result.items() 
-                             if k != 'aruco_marker'}, indent=2))
+        # Detection settings
+        self.target_marker_id = 0
+        self.detection_enabled = True
+        self.show_axes = True
+        self.show_info = True
         
-        # Show visualization
-        vis_image = transformer.create_visualization(test_image, aruco_pose, target_pixel)
-        cv2.imshow('ArUco Transformer Test', vis_image)
-        print("\nPress any key to close...")
-        cv2.waitKey(0)
+        # Create windows
+        cv2.namedWindow('ArUco Detection')
+        cv2.namedWindow('Reference Frame Info')
+        
+        # Mouse callback for target selection
+        self.target_pixel = None
+        cv2.setMouseCallback('ArUco Detection', self.on_mouse)
+    
+    def on_mouse(self, event, x, y, flags, param):
+        """Handle mouse events for target selection"""
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.target_pixel = (x, y)
+            print(f"🎯 Target selected at pixel ({x}, {y})")
+    
+    def on_new_frame(self):
+        """Called when new frame arrives"""
+        self.event.set()
+    
+    def on_stream_stopped(self):
+        """Called when stream stops"""
+        print('Stream stopped')
+    
+    def connect_to_device(self, dev_idx=0):
+        """Connect to RGBD device"""
+        print('Searching for devices')
+        devs = Record3DStream.get_connected_devices()
+        print('{} device(s) found'.format(len(devs)))
+        for dev in devs:
+            print('\tID: {}\n\tUDID: {}\n'.format(dev.product_id, dev.udid))
+
+        if len(devs) <= dev_idx:
+            raise RuntimeError('Cannot connect to device #{}, try different index.'
+                               .format(dev_idx))
+
+        dev = devs[dev_idx]
+        self.session = Record3DStream()
+        self.session.on_new_frame = self.on_new_frame
+        self.session.on_stream_stopped = self.on_stream_stopped
+        self.session.connect(dev)
+    
+    def get_intrinsic_mat_from_coeffs(self, coeffs):
+        """Get intrinsic matrix from camera coefficients"""
+        return np.array([[coeffs.fx,         0, coeffs.tx],
+                         [        0, coeffs.fy, coeffs.ty],
+                         [        0,         0,         1]])
+    
+    def initialize_aruco_transformer(self):
+        """Initialize ArUco transformer with camera parameters"""
+        if self.camera_matrix is not None:
+            # Use actual camera matrix from RGBD stream
+            camera_matrix = self.camera_matrix
+            # Assume no distortion for now
+            dist_coeffs = np.zeros((4, 1), dtype=np.float32)
+            
+            self.aruco_transformer = ArucoTransformer(
+                camera_matrix=camera_matrix,
+                dist_coeffs=dist_coeffs,
+                marker_size=0.05  # 5cm marker size
+            )
+            print(f"[ArUco] ✅ Initialized with camera matrix:")
+            print(f"[ArUco] Focal length: ({camera_matrix[0,0]:.1f}, {camera_matrix[1,1]:.1f})")
+            print(f"[ArUco] Principal point: ({camera_matrix[0,2]:.1f}, {camera_matrix[1,2]:.1f})")
+            return True
+        else:
+            print("[ArUco] ❌ Camera matrix not available yet")
+            return False
+    
+    def create_info_display(self, aruco_pose=None):
+        """Create information display window"""
+        info_image = np.ones((400, 500, 3), dtype=np.uint8) * 50
+        
+        # Title
+        cv2.putText(info_image, "ArUco Reference Frame Detector", (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        
+        y_offset = 70
+        
+        if aruco_pose and aruco_pose.get('found'):
+            # Marker detected
+            cv2.putText(info_image, f"✅ Marker ID {aruco_pose['marker_id']} DETECTED", 
+                       (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            y_offset += 40
+            
+            # Position information
+            pos = aruco_pose['position']
+            cv2.putText(info_image, f"Position (camera frame):", (10, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            y_offset += 25
+            cv2.putText(info_image, f"  X: {pos['x']:.3f} m", (20, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            y_offset += 20
+            cv2.putText(info_image, f"  Y: {pos['y']:.3f} m", (20, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            y_offset += 20
+            cv2.putText(info_image, f"  Z: {pos['z']:.3f} m", (20, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            y_offset += 30
+            
+            # Distance from camera
+            distance = np.sqrt(pos['x']**2 + pos['y']**2 + pos['z']**2)
+            cv2.putText(info_image, f"Distance: {distance:.3f} m", (10, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            y_offset += 30
+            
+            # Euler angles
+            if 'rotation_vector' in aruco_pose:
+                rvec = np.array(aruco_pose['rotation_vector'])
+                roll, pitch, yaw = self.aruco_transformer.rotation_vector_to_euler(rvec)
+                cv2.putText(info_image, f"Orientation (radians):", (10, y_offset), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                y_offset += 25
+                cv2.putText(info_image, f"  Roll: {roll:.3f}", (20, y_offset), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                y_offset += 20
+                cv2.putText(info_image, f"  Pitch: {pitch:.3f}", (20, y_offset), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                y_offset += 20
+                cv2.putText(info_image, f"  Yaw: {yaw:.3f}", (20, y_offset), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                y_offset += 30
+            
+            # Target transformation
+            if self.target_pixel and self.aruco_transformer:
+                # Get depth at target pixel (if available)
+                depth = self.session.get_depth_frame()
+                if depth is not None:
+                    x, y = self.target_pixel
+                    if 0 <= y < depth.shape[0] and 0 <= x < depth.shape[1]:
+                        depth_value = float(depth[y, x])
+                        if depth_value > 0:
+                            target_3d = self.aruco_transformer.pixel_to_3d_point(x, y, depth_value)
+                            if target_3d is not None:
+                                result = self.aruco_transformer.get_target_relative_to_aruco(
+                                    cv2.cvtColor(self.session.get_rgb_frame(), cv2.COLOR_RGB2BGR), 
+                                    target_3d, 
+                                    self.target_marker_id
+                                )
+                                if result:
+                                    rel_pos = result['relative_position']
+                                    cv2.putText(info_image, f"Target (marker frame):", (10, y_offset), 
+                                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                                    y_offset += 25
+                                    cv2.putText(info_image, f"  X: {rel_pos['x']:.3f} m", (20, y_offset), 
+                                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                                    y_offset += 20
+                                    cv2.putText(info_image, f"  Y: {rel_pos['y']:.3f} m", (20, y_offset), 
+                                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                                    y_offset += 20
+                                    cv2.putText(info_image, f"  Z: {rel_pos['z']:.3f} m", (20, y_offset), 
+                                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        else:
+            # No marker detected
+            cv2.putText(info_image, "❌ NO MARKER DETECTED", (10, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            y_offset += 40
+            cv2.putText(info_image, "Place ArUco marker ID 0 in view", (10, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            y_offset += 30
+            cv2.putText(info_image, "Ensure good lighting and contrast", (10, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        
+        # Controls info
+        y_offset += 40
+        cv2.putText(info_image, "Controls:", (10, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        y_offset += 25
+        cv2.putText(info_image, "  Click: Select target point", (10, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        y_offset += 20
+        cv2.putText(info_image, "  'q': Quit", (10, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        y_offset += 20
+        cv2.putText(info_image, "  'i': Toggle info display", (10, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        return info_image
+    
+    def start_processing_stream(self):
+        """Start processing the RGBD stream"""
+        print("🎯 ArUco Reference Frame Detector")
+        print("=" * 50)
+        print("Looking for ArUco marker ID 0 as reference frame")
+        print("Click on the detection window to select target points")
+        print("Press 'q' to quit, 'i' to toggle info display")
+        print("=" * 50)
+        
+        while True:
+            self.event.wait()  # Wait for new frame to arrive
+
+            # Get RGBD data
+            rgb = self.session.get_rgb_frame()
+            depth = self.session.get_depth_frame()
+            intrinsic_mat = self.get_intrinsic_mat_from_coeffs(self.session.get_intrinsic_mat())
+
+            # Update camera matrix
+            if self.camera_matrix is None:
+                self.camera_matrix = intrinsic_mat
+                self.initialize_aruco_transformer()
+
+            # Postprocess frames
+            if self.session.get_device_type() == self.DEVICE_TYPE__TRUEDEPTH:
+                depth = cv2.flip(depth, 1)
+                rgb = cv2.flip(rgb, 1)
+
+            # Convert RGB to BGR for OpenCV
+            rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+            # Detect ArUco marker
+            aruco_pose = None
+            if self.aruco_transformer and self.detection_enabled:
+                aruco_pose = self.aruco_transformer.detect_aruco_marker(rgb, self.target_marker_id)
+
+            # Create visualization
+            vis_image = self.aruco_transformer.create_visualization(rgb_bgr, aruco_pose, self.target_pixel) if self.aruco_transformer else rgb_bgr
+
+            # Add status text
+            if aruco_pose:
+                status_text = f"Marker {aruco_pose['marker_id']} DETECTED"
+                color = (0, 255, 0)
+            else:
+                status_text = "NO MARKER DETECTED"
+                color = (0, 0, 255)
+            
+            cv2.putText(vis_image, status_text, (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            
+            if self.target_pixel:
+                cv2.putText(vis_image, f"Target: {self.target_pixel}", (10, 60), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+            # Show detection window
+            cv2.imshow('ArUco Detection', vis_image)
+            
+            # Show info window
+            if self.show_info:
+                info_image = self.create_info_display(aruco_pose)
+                cv2.imshow('Reference Frame Info', info_image)
+
+            # Handle keyboard input
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("\n👋 Quitting...")
+                break
+            elif key == ord('i'):
+                self.show_info = not self.show_info
+                if not self.show_info:
+                    cv2.destroyWindow('Reference Frame Info')
+                print(f"ℹ️  Info display: {'ON' if self.show_info else 'OFF'}")
+
+            self.event.clear()
+
+def main():
+    """Main function to run the standalone ArUco detector"""
+    detector = StandaloneArucoDetector()
+    
+    try:
+        detector.connect_to_device(dev_idx=0)
+        detector.start_processing_stream()
+    except KeyboardInterrupt:
+        print("\nApplication stopped by user")
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
         cv2.destroyAllWindows()
-    else:
-        print("ArUco marker detection failed")
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "test":
-        test_aruco_transformer()
-    else:
-        print("ArUco Transformer Module")
-        print("Use 'python aruco_transformer.py test' to run test")
+    main()
