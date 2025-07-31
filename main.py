@@ -28,23 +28,26 @@ class KinematicsApp(DemoApp):
         self.position_tolerance = 0.03
         self.orientation_tolerance = 0.2
 
+    def convert_to_robot_frame(self, aruco_coords_m):
+        """Convert ArUco-frame metres to robot-frame centimetres applying offset and axis swap/negate"""
+        ax, ay, az = aruco_coords_m  # metres
+        rx_cm =  ax * 100.0          # x stays, convert to cm
+        ry_cm = -az * 100.0          # y = -Z, cm
+        rz_cm = (-ay + 0.13) * 100.0 # z = (-Y + 0.13m) -> cm
+        return rx_cm, ry_cm, rz_cm
+
     def prompt_and_move_robot(self, rel_coords):
         """Ask user for confirmation and move robot (convert to robot frame)"""
-        # Convert marker-frame coordinates (m) to robot-frame centimeters
-        rx, ry, rz = float(rel_coords[0]), float(rel_coords[1]), float(rel_coords[2])
-        robot_x = rx * 100                     # initial x in cm
-        robot_y = ry * 100                     # y axis
-        robot_z = rz * 100 + 13                # z in cm with 13 cm offset
-        # swap x and z
-        robot_x, robot_z = robot_z, robot_x
-        
+        rx_cm, ry_cm, rz_cm = self.convert_to_robot_frame(rel_coords)
+        print(f"\n🛰  Debug (ArUco frame m): X={rel_coords[0]:.3f}  Y={rel_coords[1]:.3f}  Z={rel_coords[2]:.3f}")
+        print(f"🛰  Converted to robot frame cm: X={rx_cm:.1f}  Y={ry_cm:.1f}  Z={rz_cm:.1f}")
         preview_curl = (
             "curl -X 'POST' \\\n"
             "  'http://192.168.178.190/move/absolute?robot_id=0' \\\n"
             "  -H 'accept: application/json' \\\n"
             "  -H 'Content-Type: application/json' \\\n"
-            "  -d '{\n"
-            f"  \"x\": {robot_x:.3f},\n  \"y\": {robot_y:.3f},\n  \"z\": {robot_z:.3f},\n  \"open\": 0,\n  \"max_trials\": 100,\n  \"position_tolerance\": 0.03,\n  \"orientation_tolerance\": 0.2\n}}'"
+            "  -d '{\\n"
+            f"  \"x\": {rx_cm:.1f},\\n  \"y\": {ry_cm:.1f},\\n  \"z\": {rz_cm:.1f},\\n  \"open\": 0,\\n  \"max_trials\": 100,\\n  \"position_tolerance\": 0.03,\\n  \"orientation_tolerance\": 0.2\\n}}'"
         )
         print("\n🛰  Proposed robot move command:\n" + preview_curl)
         try:
@@ -53,19 +56,20 @@ class KinematicsApp(DemoApp):
                 print("🚫 Move cancelled")
                 return
             payload = {
-                "x": robot_x,
-                "y": robot_y,
-                "z": robot_z,
+                "x": rx_cm,
+                "y": ry_cm,
+                "z": rz_cm,
                 "open": 0,
                 "max_trials": 100,
                 "position_tolerance": self.position_tolerance,
                 "orientation_tolerance": self.orientation_tolerance
             }
             resp = requests.post(self.robot_endpoint, json=payload, timeout=10)
+            print(f"➡️  HTTP status: {resp.status_code}")
             if resp.ok:
                 print("✅ Robot move command sent successfully")
             else:
-                print(f"❌ Robot move failed: {resp.status_code} - {resp.text}")
+                print(f"❌ Robot move failed: {resp.text}")
         except Exception as e:
             print(f"❌ Error sending move command: {e}")
     
