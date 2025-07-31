@@ -3,6 +3,7 @@ import cv2
 from rgbd_feed import DemoApp
 from vision_analyzer import VisionAnalyzer
 from aruco_transformer import ArucoTransformer
+import requests
 
 class KinematicsApp(DemoApp):
     def __init__(self):
@@ -22,6 +23,52 @@ class KinematicsApp(DemoApp):
         self.aruco_transformer = None
         self.aruco_pose = None
         
+        # Robot move settings
+        self.robot_endpoint = "http://192.168.178.190/move/absolute?robot_id=0"
+        self.position_tolerance = 0.03
+        self.orientation_tolerance = 0.2
+
+    def prompt_and_move_robot(self, rel_coords):
+        """Ask user for confirmation and move robot (convert to robot frame)"""
+        # Convert marker-frame coordinates (m) to robot-frame centimeters
+        rx, ry, rz = float(rel_coords[0]), float(rel_coords[1]), float(rel_coords[2])
+        robot_x = rx * 100                     # initial x in cm
+        robot_y = ry * 100                     # y axis
+        robot_z = rz * 100 + 13                # z in cm with 13 cm offset
+        # swap x and z
+        robot_x, robot_z = robot_z, robot_x
+        
+        preview_curl = (
+            "curl -X 'POST' \\\n"
+            "  'http://192.168.178.190/move/absolute?robot_id=0' \\\n"
+            "  -H 'accept: application/json' \\\n"
+            "  -H 'Content-Type: application/json' \\\n"
+            "  -d '{\n"
+            f"  \"x\": {robot_x:.3f},\n  \"y\": {robot_y:.3f},\n  \"z\": {robot_z:.3f},\n  \"open\": 0,\n  \"max_trials\": 100,\n  \"position_tolerance\": 0.03,\n  \"orientation_tolerance\": 0.2\n}}'"
+        )
+        print("\n🛰  Proposed robot move command:\n" + preview_curl)
+        try:
+            answer = input("\n🤖 Send this command? (y/n): ").strip().lower()
+            if answer != 'y':
+                print("🚫 Move cancelled")
+                return
+            payload = {
+                "x": robot_x,
+                "y": robot_y,
+                "z": robot_z,
+                "open": 0,
+                "max_trials": 100,
+                "position_tolerance": self.position_tolerance,
+                "orientation_tolerance": self.orientation_tolerance
+            }
+            resp = requests.post(self.robot_endpoint, json=payload, timeout=10)
+            if resp.ok:
+                print("✅ Robot move command sent successfully")
+            else:
+                print(f"❌ Robot move failed: {resp.status_code} - {resp.text}")
+        except Exception as e:
+            print(f"❌ Error sending move command: {e}")
+    
     def pixel_to_3d_position(self, u, v, depth_value):
         """
         Convert pixel coordinates (u,v) and depth to 3D position relative to camera.
@@ -149,6 +196,40 @@ class KinematicsApp(DemoApp):
                     if pos_3d:
                         X, Y, Z = pos_3d
                         print(f"Vision Click D({x},{y})->RGB({rgb_x},{rgb_y}) -> Depth: {depth_value:.3f}m, 3D: ({X:.3f},{Y:.3f},{Z:.3f})")
+    
+        # Handle manual mode left-click for robot move
+        if not self.vision_mode and event == cv2.EVENT_LBUTTONDOWN and self.depth is not None:
+            if 0 <= y < self.depth.shape[0] and 0 <= x < self.depth.shape[1]:
+                depth_value = float(self.depth[y, x])
+                if depth_value <= 0:
+                    print("⚠️  Invalid depth at selected pixel")
+                    return
+                # Convert to RGB coordinates
+                if self.current_rgb is not None:
+                    rgb_height, rgb_width = self.current_rgb.shape[:2]
+                    depth_height, depth_width = self.depth.shape[:2]
+                    if rgb_width != depth_width or rgb_height != depth_height:
+                        scale_x = rgb_width / depth_width
+                        scale_y = rgb_height / depth_height
+                        rgb_x = int(x * scale_x)
+                        rgb_y = int(y * scale_y)
+                    else:
+                        rgb_x, rgb_y = x, y
+                else:
+                    rgb_x, rgb_y = x, y
+                # Calculate 3D position
+                if self.intrinsic_mat is not None:
+                    pos_3d = self.pixel_to_3d_position(rgb_x, rgb_y, depth_value)
+                    if pos_3d:
+                        X, Y, Z = pos_3d
+                        print(f"CLICK -> 3D: ({X:.3f},{Y:.3f},{Z:.3f})")
+                        if self.aruco_pose and self.aruco_transformer:
+                            rel = self.aruco_transformer.transform_to_aruco_frame(np.array([X, Y, Z]), self.aruco_pose)
+                            if rel is not None:
+                                print(f"[ArUco] Relative to marker: ({rel[0]:.3f},{rel[1]:.3f},{rel[2]:.3f})")
+                                self.prompt_and_move_robot(rel)
+                else:
+                    print("⚠️  Intrinsic matrix not available yet")
     
     def get_3d_position_from_input(self):
         """Get 3D position from user input of pixel coordinates"""
@@ -517,6 +598,7 @@ class KinematicsApp(DemoApp):
                                     rel = self.aruco_transformer.transform_to_aruco_frame(np.array([X, Y, Z]), self.aruco_pose)
                                     if rel is not None:
                                         print(f"Relative to marker: ({rel[0]:.3f}, {rel[1]:.3f}, {rel[2]:.3f})m")
+                                        self.prompt_and_move_robot(rel)
                                 print(f"Confidence: {result.get('confidence', 'N/A')}")
                                 
                                 # Store RGB coordinates for overlay (since RGB display uses RGB coords)
