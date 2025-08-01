@@ -89,13 +89,56 @@ class VisionAnalyzer:
         
         return base64.b64encode(buffer.getvalue()).decode('utf-8')
     
-    def analyze_image(self, rgb_image: np.ndarray, target_description: str) -> Optional[Dict[str, Any]]:
+    def refine_pixel_with_depth(self, rgb_x, rgb_y, depth, rgb, max_radius=8):
+        """Move (rgb_x,rgb_y) onto nearest pixel on same depth plane for better accuracy."""
+        if depth is None:
+            return rgb_x, rgb_y
+            
+        h_r, w_r = rgb.shape[:2]
+        h_d, w_d = depth.shape[:2]
+        
+        # Map RGB coordinates to depth coordinates
+        d_x = int(rgb_x * w_d / w_r)
+        d_y = int(rgb_y * h_d / h_r)
+        
+        # Check bounds
+        if not (0 <= d_y < h_d and 0 <= d_x < w_d):
+            return rgb_x, rgb_y
+            
+        base_z = depth[d_y, d_x]
+        if base_z <= 0:
+            return rgb_x, rgb_y
+            
+        # Search for best pixel on same depth surface
+        best = (0, 0, float('inf'))  # dx, dy, score
+        
+        for r in range(1, max_radius + 1):
+            for dy in range(-r, r + 1):
+                dx_range = [-r, r] if abs(dy) == r else range(-r, r + 1)
+                for dx in dx_range:
+                    yy, xx = d_y + dy, d_x + dx
+                    if 0 <= yy < h_d and 0 <= xx < w_d:
+                        z = depth[yy, xx]
+                        if 0 < z <= base_z * 1.05:  # Same surface (within 5%)
+                            score = abs(z - base_z)
+                            if score < best[2]:
+                                best = (dx, dy, score)
+        
+        # Convert back to RGB coordinates
+        dx, dy, _ = best
+        refined_x = rgb_x + dx * w_r / w_d
+        refined_y = rgb_y + dy * h_r / h_d
+        
+        return int(refined_x), int(refined_y)
+
+    def analyze_image(self, rgb_image: np.ndarray, target_description: str, depth_frame: np.ndarray = None) -> Optional[Dict[str, Any]]:
         """
         Analyze RGB image to find target object and return pixel coordinates
         
         Args:
             rgb_image: OpenCV RGB image (BGR format)
             target_description: Natural language description of target object
+            depth_frame: Optional depth frame for pixel refinement
             
         Returns:
             Dictionary with analysis results or None if failed
@@ -105,27 +148,45 @@ class VisionAnalyzer:
             return None
         
         try:
-            # Get image dimensions
+            # Get original image dimensions
             img_height, img_width = rgb_image.shape[:2]
             print(f"[Vision] Analyzing image: {img_width}x{img_height}")
             
-            # Convert image to base64
-            base64_image = self.image_to_base64(rgb_image)
+            # Upsample image for better Claude accuracy if needed
+            scale_factor = 1.0
+            if max(img_width, img_height) < 1200:
+                scale_factor = min(2.0, 1200 / max(img_width, img_height))
+                scaled_width = int(img_width * scale_factor)
+                scaled_height = int(img_height * scale_factor)
+                rgb_for_analysis = cv2.resize(rgb_image, (scaled_width, scaled_height), 
+                                            interpolation=cv2.INTER_CUBIC)
+                print(f"[Vision] Upsampled to: {scaled_width}x{scaled_height} (scale: {scale_factor:.2f})")
+            else:
+                rgb_for_analysis = rgb_image
+                scaled_width, scaled_height = img_width, img_height
             
-            # Create system prompt
+            # Convert image to base64
+            base64_image = self.image_to_base64(rgb_for_analysis)
+            
+            # Create improved system prompt with precision emphasis
             system_prompt = f"""You are a Vision-Language-Action model for robotic manipulation with RGBD cameras.
             Analyze the provided RGB image to identify the specified object and determine target pixel coordinates.
             
-            Image dimensions: {img_width}x{img_height}
+            Image dimensions: {scaled_width}x{scaled_height}
             
             Look carefully at the image to identify: "{target_description}"
             
-            Provide pixel coordinates where a robot should target to interact with the object.
-            Consider the object's center or a good grasping point.
+            CRITICAL: The output pixel must be the EXACT CENTER of the object ±2 pixels.
+            Remember the camera image will be rescaled to a smaller depth frame (192x256).
+            Large localization errors will break the robot grasping system.
+            
+            Provide both a bounding box around the object AND the best grasp point within it.
+            Consider the object's center or the most stable grasping point.
             
             Return your response in this exact JSON format:
             {{
                 "success": true,
+                "bbox": [x0, y0, x1, y1],
                 "target_pixel": [x, y],
                 "confidence": 0.95,
                 "object_found": true,
@@ -137,13 +198,15 @@ class VisionAnalyzer:
             If you cannot find the object, return:
             {{
                 "success": false,
+                "bbox": null,
                 "target_pixel": null,
                 "confidence": 0.0,
                 "object_found": false,
                 "reasoning": "explanation of why object was not found"
             }}
             
-            Ensure pixel coordinates are within bounds: x (0 to {img_width-1}), y (0 to {img_height-1}).
+            Ensure pixel coordinates are within bounds: x (0 to {scaled_width-1}), y (0 to {scaled_height-1}).
+            The bounding box should tightly enclose the object with minimal background.
             """
             
             # Prepare message
@@ -160,7 +223,7 @@ class VisionAnalyzer:
                     },
                     {
                         "type": "text",
-                        "text": f"Find and locate: {target_description}\n\nAnalyze the image and provide target pixel coordinates for robotic interaction."
+                        "text": f"Find and locate: {target_description}\n\nAnalyze the image and provide PRECISE target pixel coordinates and bounding box for robotic interaction. Focus on the exact center of the object."
                     }
                 ]
             }
@@ -190,15 +253,48 @@ class VisionAnalyzer:
                 print("[Vision] No valid JSON found in response")
                 return None
             
-            # Validate and clean result
+            # Validate and process result
             if result.get('success') and result.get('target_pixel'):
                 x, y = result['target_pixel']
-                # Ensure coordinates are within bounds
+                
+                # Scale coordinates back to original image size
+                x = int(x / scale_factor)
+                y = int(y / scale_factor)
+                
+                # Process bounding box if available
+                if result.get('bbox'):
+                    x0, y0, x1, y1 = result['bbox']
+                    # Scale bbox back to original size
+                    x0 = int(x0 / scale_factor)
+                    y0 = int(y0 / scale_factor)
+                    x1 = int(x1 / scale_factor)
+                    y1 = int(y1 / scale_factor)
+                    result['bbox'] = [x0, y0, x1, y1]
+                    
+                    # Refine target pixel using bbox center if more accurate
+                    bbox_center_x = (x0 + x1) // 2
+                    bbox_center_y = (y0 + y1) // 2
+                    
+                    # Use bbox center if target pixel is far from it (likely less accurate)
+                    if abs(x - bbox_center_x) > 20 or abs(y - bbox_center_y) > 20:
+                        print(f"[Vision] Using bbox center ({bbox_center_x}, {bbox_center_y}) instead of target pixel ({x}, {y})")
+                        x, y = bbox_center_x, bbox_center_y
+                
+                # Ensure coordinates are within original image bounds
                 x = max(0, min(int(x), img_width - 1))
                 y = max(0, min(int(y), img_height - 1))
+                
+                # Apply depth-based refinement if depth frame is available
+                if depth_frame is not None:
+                    print(f"[Vision] Original pixel: ({x}, {y})")
+                    refined_x, refined_y = self.refine_pixel_with_depth(x, y, depth_frame, rgb_image)
+                    if refined_x != x or refined_y != y:
+                        print(f"[Vision] Depth-refined pixel: ({refined_x}, {refined_y})")
+                        x, y = refined_x, refined_y
+                
                 result['target_pixel'] = [x, y]
                 
-                print(f"[Vision] Object found at pixel ({x}, {y}) with confidence {result.get('confidence', 'N/A')}")
+                print(f"[Vision] Final object location: pixel ({x}, {y}) with confidence {result.get('confidence', 'N/A')}")
                 return result
             else:
                 print(f"[Vision] Object not found: {result.get('reasoning', 'No reason provided')}")
@@ -235,6 +331,15 @@ class VisionAnalyzer:
         
         x, y = result['target_pixel']
         confidence = result.get('confidence', 0.0)
+        
+        # Draw bounding box if available
+        if result.get('bbox'):
+            x0, y0, x1, y1 = result['bbox']
+            # Draw bounding box rectangle
+            cv2.rectangle(vis_image, (x0, y0), (x1, y1), (255, 0, 0), 2)
+            # Add bbox label
+            cv2.putText(vis_image, "BBox", (x0, y0 - 5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
         
         # Draw crosshair
         cross_size = 20

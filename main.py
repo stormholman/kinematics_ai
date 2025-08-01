@@ -425,7 +425,7 @@ class KinematicsApp(DemoApp):
             print("⏳ Processing...")
             
             # Analyze the current RGB frame
-            result = self.vision_analyzer.analyze_image(self.current_rgb, target_description)
+            result = self.vision_analyzer.analyze_image(self.current_rgb, target_description, self.depth)
             
             if result and result.get('success'):
                 self.vision_result = result
@@ -711,7 +711,7 @@ class KinematicsApp(DemoApp):
             # Auto-analyze first frame in AI mode (AFTER ArUco detection is done)
             if mode == 'ai' and not first_frame_processed and self.vision_target_description and self.rgb_intrinsic_mat is not None:
                 print("🔍 Analyzing first frame with AI...")
-                result = self.vision_analyzer.analyze_image(self.current_rgb, self.vision_target_description)
+                result = self.vision_analyzer.analyze_image(self.current_rgb, self.vision_target_description, self.depth)
                 
                 if result and result.get('success'):
                     self.vision_result = result
@@ -891,7 +891,7 @@ class KinematicsApp(DemoApp):
                 if new_task:
                     self.vision_target_description = new_task
                     print("🔄 Re-analyzing with new task...")
-                    result = self.vision_analyzer.analyze_image(self.current_rgb, new_task)
+                    result = self.vision_analyzer.analyze_image(self.current_rgb, new_task, self.depth)
                     
                     if result and result.get('success'):
                         self.vision_result = result
