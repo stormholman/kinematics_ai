@@ -2,7 +2,6 @@ import numpy as np
 import cv2
 from rgbd_feed import DemoApp
 from vision_analyzer import VisionAnalyzer
-from aruco_transformer import ArucoTransformer
 import requests
 
 class KinematicsApp(DemoApp):
@@ -21,20 +20,105 @@ class KinematicsApp(DemoApp):
         # Current RGB frame for vision analysis
         self.current_rgb = None
         
-        # ArUco transformer and pose
-        self.aruco_transformer = None
-        self.aruco_pose = None
+        # ArUco detection - direct approach from aruco_rgbd_stream.py
+        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_ARUCO_ORIGINAL)
+        params = cv2.aruco.DetectorParameters()
+        params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        # Add the same parameters as the working script
+        params.adaptiveThreshWinSizeMin = 3
+        params.adaptiveThreshWinSizeMax = 23
+        params.adaptiveThreshWinSizeStep = 10
+        params.adaptiveThreshConstant = 7
+        params.minMarkerPerimeterRate = 0.1
+        params.maxMarkerPerimeterRate = 0.8
+        params.polygonalApproxAccuracyRate = 0.05
+        params.minCornerDistanceRate = 0.1
+        params.minDistanceToBorder = 3
+        params.minOtsuStdDev = 5.0
+        params.perspectiveRemovePixelPerCell = 4
+        params.perspectiveRemoveIgnoredMarginPerCell = 0.13
+        params.maxErroneousBitsInBorderRate = 0.2
+        params.minMarkerDistanceRate = 0.05
+        params.cornerRefinementWinSize = 5
+        params.cornerRefinementMaxIterations = 30
+        params.cornerRefinementMinAccuracy = 0.1
+        self.aruco_detector = cv2.aruco.ArucoDetector(self.aruco_dict, params)
+        self.dist_coeffs = np.zeros((4, 1), dtype=np.float32)
         
-        # ArUco settings - ADJUST THIS TO MATCH YOUR PRINTED MARKER SIZE
-        self.aruco_marker_size = 0.04  # 4cm marker size - CORRECT!
+        # ArUco marker settings
+        self.aruco_marker_id = 0
+        self.aruco_marker_size = 0.04  # 4cm marker size
+        self.current_pose_T_cam_marker = None  # 4x4 homogeneous transformation
         
-        # Debug mode for marker size testing
-        self.debug_marker_size = False
+        # Storage for last clicked pixel and its marker-frame coordinates
+        self.clicked_pixel = None           # (u,v)
+        self.clicked_marker = None          # (x,y,z) in marker frame
         
         # Robot move settings
         self.robot_endpoint = "http://192.168.178.190/move/absolute?robot_id=0"
         self.position_tolerance = 0.03
         self.orientation_tolerance = 0.2
+
+    def estimate_pose_from_corners(self, corners_2d):
+        """Estimate ArUco marker pose from detected corners"""
+        # marker corner positions in marker coordinate system (origin at top-left)
+        obj_pts = np.array([[0, 0, 0],
+                            [self.aruco_marker_size, 0, 0],
+                            [self.aruco_marker_size, self.aruco_marker_size, 0],
+                            [0, self.aruco_marker_size, 0]], dtype=np.float32)
+        success, rvec, tvec = cv2.solvePnP(obj_pts, corners_2d, self.rgb_intrinsic_mat, self.dist_coeffs)
+        if not success:
+            return None
+        R, _ = cv2.Rodrigues(rvec)
+        T = np.eye(4, dtype=np.float32)
+        T[:3, :3] = R
+        T[:3, 3] = tvec.flatten()
+        return T
+
+    def detect_aruco_marker(self):
+        """Detect ArUco marker in current RGB frame"""
+        if self.current_rgb is None or self.rgb_intrinsic_mat is None:
+            return False
+            
+        # Convert to grayscale for ArUco detection
+        gray = cv2.cvtColor(self.current_rgb, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = self.aruco_detector.detectMarkers(gray)
+        
+        if ids is not None and self.aruco_marker_id in ids.flatten():
+            idx = list(ids.flatten()).index(self.aruco_marker_id)
+            self.current_pose_T_cam_marker = self.estimate_pose_from_corners(corners[idx][0])
+            return self.current_pose_T_cam_marker is not None
+        else:
+            self.current_pose_T_cam_marker = None
+            return False
+
+    def pixel_to_marker_coordinates(self, rgb_x, rgb_y):
+        """Convert RGB pixel coordinates to marker frame coordinates"""
+        if self.current_pose_T_cam_marker is None:
+            print("⚠️  Cannot compute – marker pose not available")
+            return None
+            
+        # Get depth at RGB pixel (handle scaling automatically)
+        depth_val = self.get_depth_at_rgb_coordinate(rgb_x, rgb_y)
+        if depth_val is None or depth_val <= 0:
+            print("⚠️  Invalid depth at pixel")
+            return None
+
+        # Convert pixel to 3D camera coordinates
+        fx, fy = self.rgb_intrinsic_mat[0, 0], self.rgb_intrinsic_mat[1, 1]
+        cx, cy = self.rgb_intrinsic_mat[0, 2], self.rgb_intrinsic_mat[1, 2]
+        X = (rgb_x - cx) * depth_val / fx
+        Y = (rgb_y - cy) * depth_val / fy
+        Z = depth_val
+        pt_cam = np.array([X, Y, Z, 1.0])
+        
+        # Transform to marker frame
+        pt_marker = np.linalg.inv(self.current_pose_T_cam_marker) @ pt_cam
+        marker_coords = pt_marker[:3]
+        
+        print(f"RGB pixel ({rgb_x},{rgb_y}) depth {depth_val:.3f} m → Camera ({X:.3f},{Y:.3f},{Z:.3f}) → Marker ({marker_coords[0]:.3f},{marker_coords[1]:.3f},{marker_coords[2]:.3f}) m")
+        
+        return marker_coords
 
     def convert_to_robot_frame(self, aruco_coords_m):
         """Convert ArUco-frame metres to robot-frame centimetres with proper axis mapping
@@ -53,8 +137,8 @@ class KinematicsApp(DemoApp):
         
         # Apply the correct mapping (keep in metres first):
         robot_x_m = -ay           # robot X = -aruco Y (negative because robot left is negative ArUco Y)
-        robot_y_m = -az           # robot Y = -aruco Z (negative because robot away is negative ArUco Z)
-        robot_z_m = ax + 0.13     # robot Z = aruco X + 13cm offset (robot height is ArUco X plus elevation)
+        robot_y_m = -ax           # robot Y = -aruco Z (negative because robot away is negative ArUco Z)
+        robot_z_m = -az - 0.13     # robot Z = aruco X + 13cm offset (robot height is ArUco X plus elevation)
         
         # Convert to centimetres
         rx_cm = robot_x_m * 100.0
@@ -163,7 +247,7 @@ class KinematicsApp(DemoApp):
             return None
     
     def on_mouse(self, event, x, y, flags, param):
-        """Override mouse callback to also calculate 3D position"""
+        """Override mouse callback to handle pixel-to-marker coordinate conversion"""
         if self.depth is not None and event == cv2.EVENT_MOUSEMOVE:
             if 0 <= y < self.depth.shape[0] and 0 <= x < self.depth.shape[1]:
                 # x, y are in depth frame coordinates
@@ -196,10 +280,9 @@ class KinematicsApp(DemoApp):
                         if pos_3d:
                             X, Y, Z = pos_3d
                             print(f"Manual D({x},{y})->RGB({rgb_x},{rgb_y}) -> Depth: {depth_value:.3f}m, 3D: ({X:.3f},{Y:.3f},{Z:.3f})")
-                            if self.aruco_pose and self.aruco_transformer:
-                                rel = self.aruco_transformer.transform_to_aruco_frame(np.array([X, Y, Z]), self.aruco_pose)
-                                if rel is not None:
-                                    print(f"[ArUco] Relative to marker: ({rel[0]:.3f},{rel[1]:.3f},{rel[2]:.3f})")
+                            # Show marker coordinates if available
+                            if self.current_pose_T_cam_marker is not None:
+                                marker_coords = self.pixel_to_marker_coordinates(rgb_x, rgb_y)
                     else:
                         print(f"Depth at D({x},{y}): {depth_value:.3f} meters")
         
@@ -232,13 +315,14 @@ class KinematicsApp(DemoApp):
                         X, Y, Z = pos_3d
                         print(f"Vision Click D({x},{y})->RGB({rgb_x},{rgb_y}) -> Depth: {depth_value:.3f}m, 3D: ({X:.3f},{Y:.3f},{Z:.3f})")
     
-        # Handle manual mode left-click for robot move
+        # Handle manual mode left-click for robot move with marker coordinates
         if not self.vision_mode and event == cv2.EVENT_LBUTTONDOWN and self.depth is not None:
             if 0 <= y < self.depth.shape[0] and 0 <= x < self.depth.shape[1]:
                 depth_value = float(self.depth[y, x])
                 if depth_value <= 0:
                     print("⚠️  Invalid depth at selected pixel")
                     return
+                    
                 # Convert to RGB coordinates
                 if self.current_rgb is not None:
                     rgb_height, rgb_width = self.current_rgb.shape[:2]
@@ -252,31 +336,21 @@ class KinematicsApp(DemoApp):
                         rgb_x, rgb_y = x, y
                 else:
                     rgb_x, rgb_y = x, y
-                # Calculate 3D position
-                if self.rgb_intrinsic_mat is not None:
-                    pos_3d = self.pixel_to_3d_position(rgb_x, rgb_y, depth_value, self.rgb_intrinsic_mat)
-                    if pos_3d:
-                        X, Y, Z = pos_3d
-                        print(f"CLICK -> 3D: ({X:.3f},{Y:.3f},{Z:.3f})")
-                        if self.aruco_pose and self.aruco_transformer:
-                            # Transform to ArUco marker frame if available
-                            if self.aruco_pose and 'transformation_matrix' in self.aruco_pose:
-                                # Get transformation matrix
-                                T = np.array(self.aruco_pose['transformation_matrix'])
-                                
-                                # Transform point from camera frame to ArUco frame
-                                camera_point = np.array([X, Y, Z, 1.0])
-                                aruco_point_homogeneous = np.linalg.inv(T) @ camera_point
-                                aruco_coords = aruco_point_homogeneous[:3]
-                                
-                                print(f"[ArUco] Relative to marker: ({aruco_coords[0]:.3f},{aruco_coords[1]:.3f},{aruco_coords[2]:.3f})")
-                                
-                                # Send to robot
-                                self.prompt_and_move_robot(aruco_coords)
-                            else:
-                                print("[ArUco] ❌ No marker detected - cannot transform coordinates")
+                    
+                # Store clicked pixel and convert to marker coordinates
+                self.clicked_pixel = (rgb_x, rgb_y)
+                self.clicked_marker = None
+                
+                if self.current_pose_T_cam_marker is not None:
+                    marker_coords = self.pixel_to_marker_coordinates(rgb_x, rgb_y)
+                    if marker_coords is not None:
+                        self.clicked_marker = marker_coords
+                        # Send to robot
+                        self.prompt_and_move_robot(marker_coords)
+                    else:
+                        print("⚠️  Could not convert to marker coordinates")
                 else:
-                    print("⚠️  Intrinsic matrix not available yet")
+                    print("[ArUco] ❌ No marker detected - cannot transform coordinates")
     
     def get_3d_position_from_input(self):
         """Get 3D position from user input of pixel coordinates"""
@@ -596,17 +670,11 @@ class KinematicsApp(DemoApp):
                 print(f"[Camera] Note: iPhone RGB and depth cameras are co-located with very similar intrinsics")
                 self._intrinsics_printed = True
 
-            # Initialize ArUco transformer once we have intrinsics
-            if self.aruco_transformer is None and self.rgb_intrinsic_mat is not None:
-                self.aruco_transformer = ArucoTransformer(camera_matrix=self.rgb_intrinsic_mat,
-                                                            dist_coeffs=np.zeros((4,1), dtype=np.float32),
-                                                            marker_size=self.aruco_marker_size)
-                print("[ArUco] Transformer initialized")
-            
             # Detect ArUco marker each frame (ID 0 by default)
-            if self.aruco_transformer and self.current_rgb is not None:
-                rgb_for_aruco = cv2.cvtColor(self.current_rgb, cv2.COLOR_BGR2RGB)
-                self.aruco_pose = self.aruco_transformer.detect_aruco_marker(rgb_for_aruco, 0)
+            if self.current_rgb is not None:
+                self.current_pose_T_cam_marker = None # Reset for each frame
+                if self.rgb_intrinsic_mat is not None:
+                    self.detect_aruco_marker()
 
             # Postprocess frames
             if self.session.get_device_type() == self.DEVICE_TYPE__TRUEDEPTH:
@@ -657,23 +725,18 @@ class KinematicsApp(DemoApp):
                                 print(f"Depth Pixel: ({depth_x}, {depth_y})")
                                 print(f"Depth: {depth_value:.3f}m")
                                 print(f"3D Position: ({X:.3f}, {Y:.3f}, {Z:.3f})m")
-                                if self.aruco_pose and self.aruco_transformer:
+                                if self.current_pose_T_cam_marker is not None:
                                     # Transform to ArUco marker frame if available
-                                    if self.aruco_pose and 'transformation_matrix' in self.aruco_pose:
-                                        # Get transformation matrix
-                                        T = np.array(self.aruco_pose['transformation_matrix'])
-                                        
-                                        # Transform point from camera frame to ArUco frame
-                                        camera_point = np.array([X, Y, Z, 1.0])
-                                        aruco_point_homogeneous = np.linalg.inv(T) @ camera_point
-                                        aruco_coords = aruco_point_homogeneous[:3]
-                                        
-                                        print(f"[ArUco] Relative to marker: ({aruco_coords[0]:.3f},{aruco_coords[1]:.3f},{aruco_coords[2]:.3f})")
+                                    marker_coords = self.pixel_to_marker_coordinates(x, y)
+                                    if marker_coords is not None:
+                                        print(f"[ArUco] Relative to marker: ({marker_coords[0]:.3f},{marker_coords[1]:.3f},{marker_coords[2]:.3f})")
                                         
                                         # Send to robot
-                                        self.prompt_and_move_robot(aruco_coords)
+                                        self.prompt_and_move_robot(marker_coords)
                                     else:
-                                        print("[ArUco] ❌ No marker detected - cannot transform coordinates")
+                                        print("[ArUco] ❌ Could not convert to marker coordinates")
+                                else:
+                                    print("[ArUco] ❌ No marker detected - cannot transform coordinates")
                                 print(f"Confidence: {result.get('confidence', 'N/A')}")
                                 
                                 # Store RGB coordinates for overlay (since RGB display uses RGB coords)
@@ -698,8 +761,24 @@ class KinematicsApp(DemoApp):
                 rgb = self.vision_analyzer.create_visualization(rgb, self.vision_result)
             
             # Overlay ArUco marker visualization on RGB
-            if self.aruco_pose and self.aruco_transformer:
-                rgb = self.aruco_transformer.create_visualization(rgb, self.aruco_pose, self.last_mouse_pos if self.last_mouse_pos else None)
+            if self.current_pose_T_cam_marker is not None:
+                # Draw ArUco marker and axes
+                gray = cv2.cvtColor(self.current_rgb, cv2.COLOR_BGR2GRAY)
+                corners, ids, _ = self.aruco_detector.detectMarkers(gray)
+                
+                if ids is not None and self.aruco_marker_id in ids.flatten():
+                    idx = list(ids.flatten()).index(self.aruco_marker_id)
+                    cv2.aruco.drawDetectedMarkers(rgb, [corners[idx]])
+                    cv2.drawFrameAxes(rgb, self.rgb_intrinsic_mat, self.dist_coeffs, 
+                                    cv2.Rodrigues(self.current_pose_T_cam_marker[:3,:3])[0], 
+                                    self.current_pose_T_cam_marker[:3,3], self.aruco_marker_size*0.5)
+                    
+                    # If a pixel was clicked, draw its marker coordinate near the pixel
+                    if self.clicked_pixel and self.clicked_marker is not None:
+                        click_u, click_v = self.clicked_pixel
+                        cv2.circle(rgb, (click_u, click_v), 6, (0, 0, 255), 2)
+                        label = f"({self.clicked_marker[0]:.2f},{self.clicked_marker[1]:.2f},{self.clicked_marker[2]:.2f})m"
+                        cv2.putText(rgb, label, (click_u + 8, click_v - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
             
             # Add mode indicator to RGB display
             mode_text = f"Mode: {'AI VISION' if self.vision_mode else 'MANUAL'}"
@@ -841,20 +920,14 @@ class KinematicsApp(DemoApp):
                     print("🧹 Cleared vision target")
                 else:
                     print("ℹ️  Not in vision mode")
-            elif key == ord('s'):
-                # Toggle marker size debug mode
-                self.debug_marker_size = not self.debug_marker_size
-                print(f"[Debug] Marker size debug mode: {'ON' if self.debug_marker_size else 'OFF'}")
             elif key == ord('+') or key == ord('='):
                 # Increase marker size
                 self.aruco_marker_size += 0.01
                 print(f"[Debug] Marker size increased to: {self.aruco_marker_size:.3f}m")
-                self.aruco_transformer = None  # Force reinitialization
             elif key == ord('-') or key == ord('_'):
                 # Decrease marker size
                 self.aruco_marker_size = max(0.01, self.aruco_marker_size - 0.01)
                 print(f"[Debug] Marker size decreased to: {self.aruco_marker_size:.3f}m")
-                self.aruco_transformer = None  # Force reinitialization
 
             self.event.clear()
 
