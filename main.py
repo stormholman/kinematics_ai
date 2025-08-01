@@ -8,7 +8,9 @@ import requests
 class KinematicsApp(DemoApp):
     def __init__(self):
         super().__init__()
-        self.intrinsic_mat = None
+        self.intrinsic_mat = None  # Keep for backward compatibility
+        self.depth_intrinsic_mat = None  # Depth camera intrinsics
+        self.rgb_intrinsic_mat = None    # RGB camera intrinsics
         
         # Vision analyzer for AI-powered object detection
         self.vision_analyzer = VisionAnalyzer()
@@ -23,17 +25,42 @@ class KinematicsApp(DemoApp):
         self.aruco_transformer = None
         self.aruco_pose = None
         
+        # ArUco settings - ADJUST THIS TO MATCH YOUR PRINTED MARKER SIZE
+        self.aruco_marker_size = 0.04  # 4cm marker size - CORRECT!
+        
+        # Debug mode for marker size testing
+        self.debug_marker_size = False
+        
         # Robot move settings
         self.robot_endpoint = "http://192.168.178.190/move/absolute?robot_id=0"
         self.position_tolerance = 0.03
         self.orientation_tolerance = 0.2
 
     def convert_to_robot_frame(self, aruco_coords_m):
-        """Convert ArUco-frame metres to robot-frame centimetres applying offset and axis swap/negate"""
+        """Convert ArUco-frame metres to robot-frame centimetres with proper axis mapping
+        
+        ArUco frame (origin at top-left corner):
+        - +X: rightward along top edge
+        - +Y: downward along left edge  
+        - +Z: out of marker plane toward camera
+        
+        Robot frame mapping:
+        - robot_x = -aruco_y (robot X is negative ArUco Y - moving left from marker top-left)
+        - robot_y = -aruco_z (robot Y is negative ArUco Z - moving away from marker)  
+        - robot_z = aruco_x + 13cm (robot Z is ArUco X + elevation offset)
+        """
         ax, ay, az = aruco_coords_m  # metres
-        rx_cm =  ax * 100.0          # x stays, convert to cm
-        ry_cm = -az * 100.0          # y = -Z, cm
-        rz_cm = (-ay + 0.13) * 100.0 # z = (-Y + 0.13m) -> cm
+        
+        # Apply the correct mapping (keep in metres first):
+        robot_x_m = -ay           # robot X = -aruco Y (negative because robot left is negative ArUco Y)
+        robot_y_m = -az           # robot Y = -aruco Z (negative because robot away is negative ArUco Z)
+        robot_z_m = ax + 0.13     # robot Z = aruco X + 13cm offset (robot height is ArUco X plus elevation)
+        
+        # Convert to centimetres
+        rx_cm = robot_x_m * 100.0
+        ry_cm = robot_y_m * 100.0
+        rz_cm = robot_z_m * 100.0
+        
         return rx_cm, ry_cm, rz_cm
 
     def prompt_and_move_robot(self, rel_coords):
@@ -73,7 +100,7 @@ class KinematicsApp(DemoApp):
         except Exception as e:
             print(f"❌ Error sending move command: {e}")
     
-    def pixel_to_3d_position(self, u, v, depth_value):
+    def pixel_to_3d_position(self, u, v, depth_value, camera_matrix=None):
         """
         Convert pixel coordinates (u,v) and depth to 3D position relative to camera.
         
@@ -81,19 +108,23 @@ class KinematicsApp(DemoApp):
             u (int): x pixel coordinate
             v (int): y pixel coordinate  
             depth_value (float): depth in meters at that pixel
+            camera_matrix (np.ndarray): Camera intrinsic matrix to use (defaults to depth camera)
             
         Returns:
             tuple: (X, Y, Z) 3D coordinates in meters relative to camera
         """
-        if self.intrinsic_mat is None:
-            print("Warning: No intrinsic matrix available yet")
+        # Use depth camera intrinsics by default
+        K = camera_matrix if camera_matrix is not None else self.depth_intrinsic_mat
+        
+        if K is None:
+            print("Warning: No camera intrinsic matrix available yet")
             return None
             
         # Extract intrinsic parameters
-        fx = self.intrinsic_mat[0, 0]  # focal length x
-        fy = self.intrinsic_mat[1, 1]  # focal length y
-        cx = self.intrinsic_mat[0, 2]  # principal point x
-        cy = self.intrinsic_mat[1, 2]  # principal point y
+        fx = K[0, 0]  # focal length x
+        fy = K[1, 1]  # focal length y
+        cx = K[0, 2]  # principal point x
+        cy = K[1, 2]  # principal point y
         
         # Convert to 3D coordinates using pinhole camera model
         X = (u - cx) * depth_value / fx
@@ -160,8 +191,8 @@ class KinematicsApp(DemoApp):
                 # Only show manual mode info if not in vision mode
                 if not self.vision_mode:
                     # Calculate 3D position using RGB coordinates
-                    if self.intrinsic_mat is not None:
-                        pos_3d = self.pixel_to_3d_position(rgb_x, rgb_y, depth_value)
+                    if self.rgb_intrinsic_mat is not None:
+                        pos_3d = self.pixel_to_3d_position(rgb_x, rgb_y, depth_value, self.rgb_intrinsic_mat)
                         if pos_3d:
                             X, Y, Z = pos_3d
                             print(f"Manual D({x},{y})->RGB({rgb_x},{rgb_y}) -> Depth: {depth_value:.3f}m, 3D: ({X:.3f},{Y:.3f},{Z:.3f})")
@@ -195,8 +226,8 @@ class KinematicsApp(DemoApp):
                 self.last_mouse_pos = (rgb_x, rgb_y)
                 self.depth_value = depth_value
                 
-                if self.intrinsic_mat is not None:
-                    pos_3d = self.pixel_to_3d_position(rgb_x, rgb_y, depth_value)
+                if self.rgb_intrinsic_mat is not None:
+                    pos_3d = self.pixel_to_3d_position(rgb_x, rgb_y, depth_value, self.rgb_intrinsic_mat)
                     if pos_3d:
                         X, Y, Z = pos_3d
                         print(f"Vision Click D({x},{y})->RGB({rgb_x},{rgb_y}) -> Depth: {depth_value:.3f}m, 3D: ({X:.3f},{Y:.3f},{Z:.3f})")
@@ -222,16 +253,28 @@ class KinematicsApp(DemoApp):
                 else:
                     rgb_x, rgb_y = x, y
                 # Calculate 3D position
-                if self.intrinsic_mat is not None:
-                    pos_3d = self.pixel_to_3d_position(rgb_x, rgb_y, depth_value)
+                if self.rgb_intrinsic_mat is not None:
+                    pos_3d = self.pixel_to_3d_position(rgb_x, rgb_y, depth_value, self.rgb_intrinsic_mat)
                     if pos_3d:
                         X, Y, Z = pos_3d
                         print(f"CLICK -> 3D: ({X:.3f},{Y:.3f},{Z:.3f})")
                         if self.aruco_pose and self.aruco_transformer:
-                            rel = self.aruco_transformer.transform_to_aruco_frame(np.array([X, Y, Z]), self.aruco_pose)
-                            if rel is not None:
-                                print(f"[ArUco] Relative to marker: ({rel[0]:.3f},{rel[1]:.3f},{rel[2]:.3f})")
-                                self.prompt_and_move_robot(rel)
+                            # Transform to ArUco marker frame if available
+                            if self.aruco_pose and 'transformation_matrix' in self.aruco_pose:
+                                # Get transformation matrix
+                                T = np.array(self.aruco_pose['transformation_matrix'])
+                                
+                                # Transform point from camera frame to ArUco frame
+                                camera_point = np.array([X, Y, Z, 1.0])
+                                aruco_point_homogeneous = np.linalg.inv(T) @ camera_point
+                                aruco_coords = aruco_point_homogeneous[:3]
+                                
+                                print(f"[ArUco] Relative to marker: ({aruco_coords[0]:.3f},{aruco_coords[1]:.3f},{aruco_coords[2]:.3f})")
+                                
+                                # Send to robot
+                                self.prompt_and_move_robot(aruco_coords)
+                            else:
+                                print("[ArUco] ❌ No marker detected - cannot transform coordinates")
                 else:
                     print("⚠️  Intrinsic matrix not available yet")
     
@@ -333,8 +376,8 @@ class KinematicsApp(DemoApp):
                 # Get depth and calculate 3D position
                 if 0 <= depth_y < self.depth.shape[0] and 0 <= depth_x < self.depth.shape[1]:
                     depth_value = float(self.depth[depth_y, depth_x])
-                    if depth_value > 0 and self.intrinsic_mat is not None:
-                        pos_3d = self.pixel_to_3d_position(x, y, depth_value)
+                    if depth_value > 0 and self.rgb_intrinsic_mat is not None:
+                        pos_3d = self.pixel_to_3d_position(x, y, depth_value, self.rgb_intrinsic_mat)
                         if pos_3d:
                             X, Y, Z = pos_3d
                             print(f"\n✅ TARGET ACQUIRED!")
@@ -531,17 +574,33 @@ class KinematicsApp(DemoApp):
             depth = self.session.get_depth_frame()
             rgb = self.session.get_rgb_frame()
             confidence = self.session.get_confidence_frame()
-            intrinsic_mat = self.get_intrinsic_mat_from_coeffs(self.session.get_intrinsic_mat())
+            
+            # Get depth intrinsics (Record3D only provides depth intrinsics)
+            # For iPhone cameras, RGB and depth intrinsics are very similar
+            depth_intrinsic_coeffs = self.session.get_intrinsic_mat()
+            
+            depth_intrinsic_mat = self.get_intrinsic_mat_from_coeffs(depth_intrinsic_coeffs)
+            # Use same intrinsics for RGB as they're co-located on iPhone
+            rgb_intrinsic_mat = depth_intrinsic_mat.copy()
+            
             camera_pose = self.session.get_camera_pose()
 
-            # Store intrinsic matrix for 3D calculations
-            self.intrinsic_mat = intrinsic_mat
+            # Store both intrinsic matrices
+            self.intrinsic_mat = depth_intrinsic_mat  # Keep for backward compatibility
+            self.depth_intrinsic_mat = depth_intrinsic_mat
+            self.rgb_intrinsic_mat = rgb_intrinsic_mat
+            
+            # Debug print intrinsics (only first time)
+            if not hasattr(self, '_intrinsics_printed'):
+                print(f"[Camera] Using shared intrinsics - fx:{depth_intrinsic_mat[0,0]:.1f} fy:{depth_intrinsic_mat[1,1]:.1f} cx:{depth_intrinsic_mat[0,2]:.1f} cy:{depth_intrinsic_mat[1,2]:.1f}")
+                print(f"[Camera] Note: iPhone RGB and depth cameras are co-located with very similar intrinsics")
+                self._intrinsics_printed = True
 
             # Initialize ArUco transformer once we have intrinsics
-            if self.aruco_transformer is None and self.intrinsic_mat is not None:
-                self.aruco_transformer = ArucoTransformer(camera_matrix=self.intrinsic_mat,
+            if self.aruco_transformer is None and self.rgb_intrinsic_mat is not None:
+                self.aruco_transformer = ArucoTransformer(camera_matrix=self.rgb_intrinsic_mat,
                                                             dist_coeffs=np.zeros((4,1), dtype=np.float32),
-                                                            marker_size=0.05)
+                                                            marker_size=self.aruco_marker_size)
                 print("[ArUco] Transformer initialized")
             
             # Detect ArUco marker each frame (ID 0 by default)
@@ -589,7 +648,7 @@ class KinematicsApp(DemoApp):
                         depth_value = float(self.depth[depth_y, depth_x])
                         if depth_value > 0:
                             # Use original RGB coordinates for 3D calculation (intrinsics are for RGB)
-                            pos_3d = self.pixel_to_3d_position(x, y, depth_value)
+                            pos_3d = self.pixel_to_3d_position(x, y, depth_value, self.rgb_intrinsic_mat)
                             if pos_3d:
                                 X, Y, Z = pos_3d
                                 print(f"\n✅ AI FOUND TARGET!")
@@ -599,10 +658,22 @@ class KinematicsApp(DemoApp):
                                 print(f"Depth: {depth_value:.3f}m")
                                 print(f"3D Position: ({X:.3f}, {Y:.3f}, {Z:.3f})m")
                                 if self.aruco_pose and self.aruco_transformer:
-                                    rel = self.aruco_transformer.transform_to_aruco_frame(np.array([X, Y, Z]), self.aruco_pose)
-                                    if rel is not None:
-                                        print(f"Relative to marker: ({rel[0]:.3f}, {rel[1]:.3f}, {rel[2]:.3f})m")
-                                        self.prompt_and_move_robot(rel)
+                                    # Transform to ArUco marker frame if available
+                                    if self.aruco_pose and 'transformation_matrix' in self.aruco_pose:
+                                        # Get transformation matrix
+                                        T = np.array(self.aruco_pose['transformation_matrix'])
+                                        
+                                        # Transform point from camera frame to ArUco frame
+                                        camera_point = np.array([X, Y, Z, 1.0])
+                                        aruco_point_homogeneous = np.linalg.inv(T) @ camera_point
+                                        aruco_coords = aruco_point_homogeneous[:3]
+                                        
+                                        print(f"[ArUco] Relative to marker: ({aruco_coords[0]:.3f},{aruco_coords[1]:.3f},{aruco_coords[2]:.3f})")
+                                        
+                                        # Send to robot
+                                        self.prompt_and_move_robot(aruco_coords)
+                                    else:
+                                        print("[ArUco] ❌ No marker detected - cannot transform coordinates")
                                 print(f"Confidence: {result.get('confidence', 'N/A')}")
                                 
                                 # Store RGB coordinates for overlay (since RGB display uses RGB coords)
@@ -671,8 +742,8 @@ class KinematicsApp(DemoApp):
                 depth_vis = cv2.addWeighted(overlay, alpha, depth_vis, 1 - alpha, 0)
                 
                 # Show 3D position if available (using RGB coordinates for calculation)
-                if self.intrinsic_mat is not None:
-                    pos_3d = self.pixel_to_3d_position(rgb_x, rgb_y, self.depth_value)
+                if self.rgb_intrinsic_mat is not None:
+                    pos_3d = self.pixel_to_3d_position(rgb_x, rgb_y, self.depth_value, self.rgb_intrinsic_mat)
                     if pos_3d:
                         X, Y, Z = pos_3d
                         if self.vision_mode:
@@ -741,7 +812,7 @@ class KinematicsApp(DemoApp):
                         if 0 <= depth_y < self.depth.shape[0] and 0 <= depth_x < self.depth.shape[1]:
                             depth_value = float(self.depth[depth_y, depth_x])
                             if depth_value > 0:
-                                pos_3d = self.pixel_to_3d_position(x, y, depth_value)
+                                pos_3d = self.pixel_to_3d_position(x, y, depth_value, self.rgb_intrinsic_mat)
                                 if pos_3d:
                                     X, Y, Z = pos_3d
                                     print(f"\n✅ NEW TARGET FOUND!")
@@ -770,6 +841,20 @@ class KinematicsApp(DemoApp):
                     print("🧹 Cleared vision target")
                 else:
                     print("ℹ️  Not in vision mode")
+            elif key == ord('s'):
+                # Toggle marker size debug mode
+                self.debug_marker_size = not self.debug_marker_size
+                print(f"[Debug] Marker size debug mode: {'ON' if self.debug_marker_size else 'OFF'}")
+            elif key == ord('+') or key == ord('='):
+                # Increase marker size
+                self.aruco_marker_size += 0.01
+                print(f"[Debug] Marker size increased to: {self.aruco_marker_size:.3f}m")
+                self.aruco_transformer = None  # Force reinitialization
+            elif key == ord('-') or key == ord('_'):
+                # Decrease marker size
+                self.aruco_marker_size = max(0.01, self.aruco_marker_size - 0.01)
+                print(f"[Debug] Marker size decreased to: {self.aruco_marker_size:.3f}m")
+                self.aruco_transformer = None  # Force reinitialization
 
             self.event.clear()
 

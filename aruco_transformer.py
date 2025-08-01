@@ -16,7 +16,7 @@ class ArucoTransformer:
     Transforms coordinates from camera frame to ArUco marker frame
     """
     
-    def __init__(self, camera_matrix: np.ndarray = None, dist_coeffs: np.ndarray = None, marker_size: float = 0.05):
+    def __init__(self, camera_matrix: np.ndarray = None, dist_coeffs: np.ndarray = None, marker_size: float = 0.04):
         """
         Initialize ArUco transformer
         
@@ -96,11 +96,17 @@ class ArucoTransformer:
                 return None
             
             # Create 3D object points for ArUco marker corners
+            # OpenCV ArUco detection returns corners in clockwise order starting from top-left:
+            # Corner 0: top-left, Corner 1: top-right, Corner 2: bottom-right, Corner 3: bottom-left
+            # Standard ArUco coordinate system: origin at first detected corner (top-left)
+            # +X axis points from corner 0 to corner 1 (rightward along top edge)
+            # +Y axis points from corner 0 to corner 3 (downward along left edge)
+            # +Z axis points out of marker plane toward camera
             marker_corners_3d = np.array([
-                [-self.marker_size/2, -self.marker_size/2, 0],
-                [self.marker_size/2, -self.marker_size/2, 0],
-                [self.marker_size/2, self.marker_size/2, 0],
-                [-self.marker_size/2, self.marker_size/2, 0]
+                [0, 0, 0],                                    # corner 0: top-left (origin)
+                [self.marker_size, 0, 0],                     # corner 1: top-right (+X direction)
+                [self.marker_size, self.marker_size, 0],      # corner 2: bottom-right (+X,+Y)
+                [0, self.marker_size, 0]                      # corner 3: bottom-left (+Y direction)
             ], dtype=np.float32)
             
             # Estimate pose using solvePnP
@@ -277,6 +283,43 @@ class ArucoTransformer:
             print(f"[ArUco] Error converting rotation vector to Euler angles: {e}")
             return (0.0, 0.0, 0.0)
     
+    def estimate_marker_size_from_corners(self, corners_2d: np.ndarray, tvec: np.ndarray) -> float:
+        """
+        Estimate actual marker size from detected corners and camera parameters
+        
+        Args:
+            corners_2d: 2D corner coordinates in pixels
+            tvec: Translation vector from camera to marker
+            
+        Returns:
+            Estimated marker size in meters
+        """
+        try:
+            # Calculate average side length in pixels
+            side_lengths = []
+            for i in range(4):
+                next_i = (i + 1) % 4
+                side_len = np.linalg.norm(corners_2d[i] - corners_2d[next_i])
+                side_lengths.append(side_len)
+            avg_side_len_pixels = np.mean(side_lengths)
+            
+            # Get camera parameters
+            fx = self.camera_matrix[0, 0]
+            fy = self.camera_matrix[1, 1]
+            
+            # Distance to marker center
+            distance = np.linalg.norm(tvec.flatten())
+            
+            # Estimate marker size using similar triangles
+            # marker_size_meters / distance = side_length_pixels / focal_length
+            estimated_size = (avg_side_len_pixels * distance) / fx
+            
+            return estimated_size
+            
+        except Exception as e:
+            print(f"[ArUco] Error estimating marker size: {e}")
+            return self.marker_size  # Return configured size as fallback
+    
     def create_visualization(self, rgb_image: np.ndarray, aruco_pose: Dict[str, Any] = None, 
                            target_pixel: Tuple[int, int] = None) -> np.ndarray:
         """
@@ -307,26 +350,50 @@ class ArucoTransformer:
             
             # Draw coordinate axes
             if 'transformation_matrix' in aruco_pose:
+                # Get transformation matrix and camera parameters
                 T = np.array(aruco_pose['transformation_matrix'])
-                origin = T[:3, 3]
+                fx = self.camera_matrix[0, 0]
+                fy = self.camera_matrix[1, 1]
+                cx = self.camera_matrix[0, 2]
+                cy = self.camera_matrix[1, 2]
                 
-                # Project origin to image coordinates
-                if self.camera_matrix is not None:
-                    fx = self.camera_matrix[0, 0]
-                    fy = self.camera_matrix[1, 1]
-                    cx = self.camera_matrix[0, 2]
-                    cy = self.camera_matrix[1, 2]
+                # Define 3D axis endpoints in marker frame
+                axis_length = self.marker_size * 0.5  # 50% of marker size
+                axes_3d = np.array([
+                    [0, 0, 0],                    # origin
+                    [axis_length, 0, 0],          # X-axis end (red)
+                    [0, axis_length, 0],          # Y-axis end (green) 
+                    [0, 0, axis_length]           # Z-axis end (blue)
+                ], dtype=np.float32)
+                
+                # Transform to camera frame and project to image
+                axes_cam = []
+                for point_3d in axes_3d:
+                    # Transform to camera frame
+                    point_cam = T[:3, :3] @ point_3d + T[:3, 3]
+                    if point_cam[2] > 0:  # Check if in front of camera
+                        # Project to image coordinates
+                        u = int(fx * point_cam[0] / point_cam[2] + cx)
+                        v = int(fy * point_cam[1] / point_cam[2] + cy)
+                        axes_cam.append((u, v))
+                    else:
+                        axes_cam.append(None)
+                
+                # Draw axes if all points are valid
+                if all(pt is not None for pt in axes_cam):
+                    origin, x_end, y_end, z_end = axes_cam
+                    # Draw axes with different colors and thickness
+                    cv2.line(vis_image, origin, x_end, (0, 0, 255), 3)    # X-axis: red
+                    cv2.line(vis_image, origin, y_end, (0, 255, 0), 3)    # Y-axis: green
+                    cv2.line(vis_image, origin, z_end, (255, 0, 0), 3)    # Z-axis: blue
                     
-                    # Project 3D point to 2D
-                    if origin[2] > 0:
-                        u = int(fx * origin[0] / origin[2] + cx)
-                        v = int(fy * origin[1] / origin[2] + cy)
-                        
-                        # Draw coordinate axes
-                        axis_length = 50
-                        cv2.line(vis_image, (u, v), (u + axis_length, v), (255, 0, 0), 2)  # X-axis (red)
-                        cv2.line(vis_image, (u, v), (u, v + axis_length), (0, 255, 0), 2)  # Y-axis (green)
-                        cv2.line(vis_image, (u, v), (u + axis_length//2, v + axis_length//2), (0, 0, 255), 2)  # Z-axis (blue)
+                    # Add axis labels
+                    cv2.putText(vis_image, "X", (x_end[0]+5, x_end[1]-5), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                    cv2.putText(vis_image, "Y", (y_end[0]+5, y_end[1]-5), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    cv2.putText(vis_image, "Z", (z_end[0]+5, z_end[1]-5), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
         
         # Draw target object
         if target_pixel:
