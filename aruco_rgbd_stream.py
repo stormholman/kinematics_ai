@@ -8,7 +8,7 @@ ARUCO_DICT_TYPE = cv2.aruco.DICT_ARUCO_ORIGINAL  # dictionary your marker was ge
 MARKER_ID = 0                             # ID of the printed marker
 MARKER_SIZE_M = 0.04                      # 4 cm physical size of the marker
 # -------------------------------------
-TARGET_POINT_MARKER = np.array([0, 0, -0.2], dtype=np.float32)  # Target point in marker frame (X, Y, Z) meters
+# (No fixed target point: user clicks to query coordinates)
 # -------------------------------------
 
 class RGBDArucoApp:
@@ -53,8 +53,9 @@ class RGBDArucoApp:
         self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, params)
         self.current_pose_T_cam_marker = None  # 4x4 homogeneous transformation
         
-        # Dynamic target point (starts with the global setting)
-        self.target_point = TARGET_POINT_MARKER.copy()
+        # Storage for last clicked pixel and its marker-frame coordinates
+        self.clicked_pixel = None           # (u,v)
+        self.clicked_marker = None          # (x,y,z) in marker frame
 
     # ------------------------------------------------------------------
     # Record3D callbacks
@@ -69,24 +70,36 @@ class RGBDArucoApp:
     # GUI mouse callback – click on RGB window to convert pixel → marker
     # ------------------------------------------------------------------
     def on_mouse(self, event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN and self.depth is not None and self.current_pose_T_cam_marker is not None:
-            if 0 <= y < self.depth.shape[0] and 0 <= x < self.depth.shape[1]:
-                depth_val = float(self.depth[y, x])
-                if depth_val == 0:
-                    print("⚠️  No depth at clicked pixel")
-                    return
-                # camera intrinsic parameters
-                fx, fy = self.camera_matrix[0, 0], self.camera_matrix[1, 1]
-                cx, cy = self.camera_matrix[0, 2], self.camera_matrix[1, 2]
-                # convert pixel to camera 3D
-                X = (x - cx) * depth_val / fx
-                Y = (y - cy) * depth_val / fy
-                Z = depth_val
-                pt_cam = np.array([X, Y, Z, 1.0])
-                # transform to marker frame
-                T = self.current_pose_T_cam_marker  # camera→marker
-                pt_marker = np.linalg.inv(T) @ pt_cam
-                print(f"Camera XYZ: ({X:.3f},{Y:.3f},{Z:.3f}) m  →  Marker XYZ: ({pt_marker[0]:.3f},{pt_marker[1]:.3f},{pt_marker[2]:.3f}) m")
+        """Handle mouse clicks: report pixel's 3-D position in marker frame."""
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.clicked_pixel = None
+            self.clicked_marker = None
+            if self.depth is None or self.current_pose_T_cam_marker is None or self.camera_matrix is None:
+                print("⚠️  Cannot compute – depth or marker pose not available")
+                return
+            # Depth and RGB may have different resolutions – translate RGB click to depth pixel
+            h_d, w_d = self.depth.shape[:2]
+            h_r, w_r = self.rgb.shape[:2]
+            depth_x = int(x * w_d / w_r)
+            depth_y = int(y * h_d / h_r)
+            if not (0 <= depth_y < h_d and 0 <= depth_x < w_d):
+                print("⚠️  Click outside frame")
+                return
+            depth_val = float(self.depth[depth_y, depth_x])
+            if depth_val <= 0:
+                print("⚠️  Invalid depth at pixel")
+                return
+
+            fx, fy = self.camera_matrix[0, 0], self.camera_matrix[1, 1]
+            cx, cy = self.camera_matrix[0, 2], self.camera_matrix[1, 2]
+            X = (x - cx) * depth_val / fx
+            Y = (y - cy) * depth_val / fy
+            Z = depth_val
+            pt_cam = np.array([X, Y, Z, 1.0])
+            pt_marker = np.linalg.inv(self.current_pose_T_cam_marker) @ pt_cam
+            self.clicked_pixel = (x, y)
+            self.clicked_marker = pt_marker[:3]
+            print(f"RGB pixel ({x},{y}) → Depth pixel ({depth_x},{depth_y}) depth {depth_val:.3f} m → Camera ({X:.3f},{Y:.3f},{Z:.3f}) → Marker ({pt_marker[0]:.3f},{pt_marker[1]:.3f},{pt_marker[2]:.3f}) m")
 
     # ------------------------------------------------------------------
     def connect_to_device(self, dev_idx: int = 0):
@@ -153,19 +166,12 @@ class RGBDArucoApp:
                 if self.current_pose_T_cam_marker is not None:
                     cv2.aruco.drawDetectedMarkers(rgb, [corners[idx]])
                     cv2.drawFrameAxes(rgb, self.camera_matrix, self.dist_coeffs, cv2.Rodrigues(self.current_pose_T_cam_marker[:3,:3])[0], self.current_pose_T_cam_marker[:3,3], MARKER_SIZE_M*0.5)
-                    # -------- Draw target point in marker frame --------
-                    pt_cam = self.current_pose_T_cam_marker[:3,:3] @ self.target_point + self.current_pose_T_cam_marker[:3,3]
-                    print(f"DEBUG: Marker point {self.target_point} → Camera point {pt_cam}")
-                    if pt_cam[2] > 0:
-                        fx, fy = self.camera_matrix[0, 0], self.camera_matrix[1, 1]
-                        cx, cy = self.camera_matrix[0, 2], self.camera_matrix[1, 2]
-                        u = int(fx * pt_cam[0] / pt_cam[2] + cx)
-                        v = int(fy * pt_cam[1] / pt_cam[2] + cy)
-                        cv2.circle(rgb, (u, v), 7, (255, 0, 255), 2)
-                        cv2.putText(rgb, f"({self.target_point[0]:.2f},{self.target_point[1]:.2f},{self.target_point[2]:.2f})m", (u+5, v-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,255),1)
-                        print(f"Marker {self.target_point}m → Camera {pt_cam} → Pixel ({u},{v})")
-                    else:
-                        print(f"DEBUG: Point is behind camera (Z={pt_cam[2]:.3f})")
+                    # If a pixel was clicked, draw its marker coordinate near the pixel
+                    if self.clicked_pixel and self.clicked_marker is not None:
+                        click_u, click_v = self.clicked_pixel
+                        cv2.circle(rgb, (click_u, click_v), 6, (0, 0, 255), 2)
+                        label = f"({self.clicked_marker[0]:.2f},{self.clicked_marker[1]:.2f},{self.clicked_marker[2]:.2f})m"
+                        cv2.putText(rgb, label, (click_u + 8, click_v - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
             else:
                 self.current_pose_T_cam_marker = None
 
@@ -176,18 +182,7 @@ class RGBDArucoApp:
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
-            elif key == ord('1'):
-                self.target_point = np.array([0.05, 0.0, 0.0], dtype=np.float32)
-                print(f"Target point set to: {self.target_point} (5cm +X)")
-            elif key == ord('2'):
-                self.target_point = np.array([0.0, 0.05, 0.0], dtype=np.float32)
-                print(f"Target point set to: {self.target_point} (5cm +Y)")
-            elif key == ord('3'):
-                self.target_point = np.array([0.0, 0.0, 0.05], dtype=np.float32)
-                print(f"Target point set to: {self.target_point} (5cm +Z)")
-            elif key == ord('0'):
-                self.target_point = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-                print(f"Target point set to: {self.target_point} (origin)")
+            # No numeric shortcuts needed in this mode
             self.event.clear()
 
         cv2.destroyAllWindows()
