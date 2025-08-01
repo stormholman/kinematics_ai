@@ -462,6 +462,23 @@ class KinematicsApp(DemoApp):
                             print(f"3D Position: ({X:.3f}, {Y:.3f}, {Z:.3f})m")
                             print(f"Confidence: {result.get('confidence', 'N/A')}")
                             
+                            # Transform to ArUco marker frame if available
+                            if self.current_pose_T_cam_marker is not None:
+                                marker_coords = self.pixel_to_marker_coordinates(x, y)
+                                if marker_coords is not None:
+                                    print(f"[ArUco] Relative to marker: ({marker_coords[0]:.3f},{marker_coords[1]:.3f},{marker_coords[2]:.3f})")
+                                    
+                                    # Store clicked pixel and marker coordinates for visualization
+                                    self.clicked_pixel = (x, y)
+                                    self.clicked_marker = marker_coords
+                                    
+                                    # Send to robot (same as manual mode)
+                                    self.prompt_and_move_robot(marker_coords)
+                                else:
+                                    print("[ArUco] ❌ Could not convert to marker coordinates")
+                            else:
+                                print("[ArUco] ❌ No marker detected - cannot transform coordinates")
+                            
                             # Store the last position for overlay (RGB coordinates)
                             self.last_mouse_pos = (x, y)
                             self.depth_value = depth_value
@@ -670,12 +687,6 @@ class KinematicsApp(DemoApp):
                 print(f"[Camera] Note: iPhone RGB and depth cameras are co-located with very similar intrinsics")
                 self._intrinsics_printed = True
 
-            # Detect ArUco marker each frame (ID 0 by default)
-            if self.current_rgb is not None:
-                self.current_pose_T_cam_marker = None # Reset for each frame
-                if self.rgb_intrinsic_mat is not None:
-                    self.detect_aruco_marker()
-
             # Postprocess frames
             if self.session.get_device_type() == self.DEVICE_TYPE__TRUEDEPTH:
                 depth = cv2.flip(depth, 1)
@@ -687,8 +698,18 @@ class KinematicsApp(DemoApp):
             self.depth = depth
             self.current_rgb = rgb.copy()
             
-            # Auto-analyze first frame in AI mode
-            if mode == 'ai' and not first_frame_processed and self.vision_target_description:
+            # Detect ArUco marker each frame for ALL modes (AFTER frames are processed and stored)
+            if self.current_rgb is not None and self.rgb_intrinsic_mat is not None:
+                was_detected = self.current_pose_T_cam_marker is not None
+                self.detect_aruco_marker()
+                # Only print when marker detection status changes
+                if self.current_pose_T_cam_marker is not None and not was_detected:
+                    print(f"[ArUco] ✅ Marker {self.aruco_marker_id} detected and pose estimated")
+                elif self.current_pose_T_cam_marker is None and was_detected:
+                    print(f"[ArUco] ❌ Marker {self.aruco_marker_id} lost")
+            
+            # Auto-analyze first frame in AI mode (AFTER ArUco detection is done)
+            if mode == 'ai' and not first_frame_processed and self.vision_target_description and self.rgb_intrinsic_mat is not None:
                 print("🔍 Analyzing first frame with AI...")
                 result = self.vision_analyzer.analyze_image(self.current_rgb, self.vision_target_description)
                 
@@ -900,6 +921,19 @@ class KinematicsApp(DemoApp):
                                     print(f"Depth Pixel: ({depth_x}, {depth_y})")
                                     print(f"Depth: {depth_value:.3f}m")
                                     print(f"3D Position: ({X:.3f}, {Y:.3f}, {Z:.3f})m")
+                                    
+                                    # Transform to ArUco marker frame if available
+                                    if self.current_pose_T_cam_marker is not None:
+                                        marker_coords = self.pixel_to_marker_coordinates(x, y)
+                                        if marker_coords is not None:
+                                            print(f"[ArUco] Relative to marker: ({marker_coords[0]:.3f},{marker_coords[1]:.3f},{marker_coords[2]:.3f})")
+                                            
+                                            # Send to robot
+                                            self.prompt_and_move_robot(marker_coords)
+                                        else:
+                                            print("[ArUco] ❌ Could not convert to marker coordinates")
+                                    else:
+                                        print("[ArUco] ❌ No marker detected - cannot transform coordinates")
                                     
                                     self.last_mouse_pos = (x, y)
                                     self.depth_value = depth_value
