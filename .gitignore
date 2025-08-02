@@ -128,11 +128,24 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# API keys and sensitive config
+# Project-specific
 config.py
-*.key
+*.png
+*.jpg
+*.jpeg
+*.mp4
+*.avi
+temp_images/
+debug_frames/
 
-# OS generated files
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
 .DS_Store
 .DS_Store?
 ._*
@@ -141,29 +154,7 @@ config.py
 ehthumbs.db
 Thumbs.db
 
-# IDE files
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# AI/ML specific
-models/
-data/
-*.pkl
-*.model
-*.weights
-*.h5
-
-# Camera/depth data
-*.rgbd
-*.depth
-*.jpg
-*.png
-*.mp4
-*.avi
-
-# Temporary files
-*.tmp
-*.temp
-temp/ 
+# API keys and sensitive data
+.env.local
+.env.production
+secrets.json 

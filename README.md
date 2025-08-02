@@ -1,253 +1,260 @@
-# Kinematics AI - RGBD 3D Position Calculator
+# Kinematics AI
 
-This project provides tools to capture RGBD data from iPhone 13 Pro using Record3D and convert 2D pixel coordinates to 3D positions relative to the camera.
+A computer vision and robotics system that combines RGBD cameras, ArUco marker tracking, and AI-powered object detection for precise robotic manipulation.
 
-## Files Overview
+## Features
 
-- **`rgbd_feed.py`** - Original RGBD stream capture from iPhone using Record3D
-- **`main.py`** - Main application with real-time 3D position calculation and AI vision
-- **`position_calculator.py`** - Utility class for 3D position calculations and testing
-- **`vision_analyzer.py`** - AI-powered object detection using Claude vision API
-- **`config.py.template`** - Configuration template for API keys
+- **RGBD Stream Processing**: Real-time RGB-D data from iPhone using Record3D
+- **ArUco Marker Tracking**: Precise 6DOF pose estimation for coordinate frame reference
+- **AI Vision Analysis**: Claude-powered object detection with natural language descriptions
+- **3D Coordinate Transformation**: Pixel → Camera → ArUco Marker → Robot coordinate conversion
+- **Robot Control**: HTTP API integration for robotic arm movement
+- **Multiple Operation Modes**: Manual, AI Vision, and Hybrid modes
 
-## Requirements
+## System Architecture
+
+```
+iPhone (Record3D) → RGBD Stream → Computer Vision Pipeline
+                                        ↓
+ArUco Detection ← RGB Frame ← Coordinate Transformation → Robot Commands
+                                        ↓
+AI Object Detection ← Depth Frame ← 3D Position Calculation
+```
+
+## Installation
+
+### Prerequisites
+
+- Python 3.8+
+- iPhone with Record3D app
+- ArUco marker (4x4cm, ID 0, DICT_ARUCO_ORIGINAL)
+- Anthropic API key for AI vision features
+
+### Dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Or install individually:
-```bash
-pip install numpy opencv-python record3d anthropic pillow
-```
+### Required Packages
 
-You'll also need:
-- iPhone 13 Pro (or compatible device) with Record3D app
-- Both devices on the same WiFi network
-- Anthropic API key (for AI vision features - optional)
+- `opencv-python` - Computer vision and ArUco detection
+- `numpy` - Numerical computations
+- `record3d` - iPhone RGBD streaming
+- `anthropic` - AI vision analysis
+- `requests` - Robot HTTP communication
+- `Pillow` - Image processing
 
-## Setup
+## Quick Start
 
-### API Key Configuration (for AI Vision)
-
-1. Get an Anthropic API key from [https://console.anthropic.com/](https://console.anthropic.com/)
-
-2. **Option 1: Using config file (recommended)**
+1. **Setup ArUco Marker**
    ```bash
-   cp config.py.template config.py
-   # Edit config.py and add your API key
+   python generate_aruco.py --id 0 --size 200 --output marker_0.png
+   ```
+   Print the generated marker at 4x4cm size.
+
+2. **Configure API Key**
+   ```bash
+   export ANTHROPIC_API_KEY="your_api_key_here"
    ```
 
-3. **Option 2: Environment variable**
+3. **Start Record3D** on your iPhone and connect to the same network.
+
+4. **Run the Application**
    ```bash
-   export ANTHROPIC_API_KEY="your-anthropic-api-key-here"
+   python main.py
    ```
 
-## Usage
+## Operation Modes
 
-### 1. Real-time RGBD Stream with AI Vision & 3D Position Calculation
+### Manual Mode
+- Mouse hover shows real-time 3D coordinates
+- Left-click sends coordinates to robot
+- Precise manual control
 
-Run the main application:
+### AI Vision Mode  
+- Describe objects in natural language
+- AI automatically finds and targets objects
+- Examples: "yellow banana", "red cup on table"
 
-```bash
-python main.py
+### Hybrid Mode
+- Switch between manual and AI modes
+- Press 'v' for AI analysis, 'm' to toggle modes
+
+## Key Components
+
+### `main.py`
+Main application with RGBD processing, ArUco detection, and robot control.
+
+### `vision_analyzer.py`  
+AI-powered object detection using Claude vision API with accuracy improvements:
+- Image upsampling for better detection
+- Bounding box validation
+- Depth-based pixel refinement
+- Precision-focused prompting
+
+### `aruco_transformer.py`
+Standalone ArUco detection and coordinate transformation (legacy).
+
+### `aruco_rgbd_stream.py`
+Simplified ArUco testing application for pixel-to-marker coordinate conversion.
+
+### `rgbd_feed.py`
+Base RGBD streaming functionality using Record3D.
+
+### `position_calculator.py`
+3D coordinate calculation utilities.
+
+## Coordinate Systems
+
+### ArUco Marker Frame
+- **Origin**: Top-left corner of marker
+- **+X**: Rightward along top edge  
+- **+Y**: Downward along left edge
+- **+Z**: Out of marker plane toward camera
+
+### Robot Frame Mapping
+```python
+robot_x = -aruco_y    # Robot X = -ArUco Y
+robot_y = -aruco_x    # Robot Y = -ArUco X  
+robot_z = -aruco_z - 0.13  # Robot Z = -ArUco Z - 13cm offset
 ```
 
-**Two Operating Modes:**
+## Configuration
 
-#### MANUAL Mode (Default)
-- **Mouse**: Move over the depth window to see real-time 3D positions
-- Click to get precise measurements
-
-#### AI VISION Mode 
-- **'v' key**: Analyze objects using natural language prompts
-- Examples: "yellow banana", "red cup on the table", "coffee mug"
-- AI automatically identifies and targets objects
-
-**Controls:**
-- **'v'**: Analyze objects with AI vision (describe what you want to target)
-- **'m'**: Toggle between MANUAL and VISION modes
-- **'c'**: Clear current vision target
-- **'p'**: Input specific pixel coordinates manually  
-- **'q'**: Quit the application
-
-**Features:**
-- Real-time depth and RGB streaming from iPhone
-- Two modes: Manual cursor selection vs AI-powered object detection
-- Mouse hover shows 3D position coordinates in manual mode
-- AI vision identifies objects from natural language descriptions
-- Visual overlays showing depth values and 3D coordinates
-- Smart crosshairs with different colors for each mode
-
-### 2. Standalone 3D Position Calculator
-
-Test the position calculation independently:
-
-```bash
-python position_calculator.py
+### Robot Endpoint
+Update in `main.py`:
+```python
+self.robot_endpoint = "http://192.168.178.190/move/absolute?robot_id=0"
 ```
 
-This provides:
-- Example calculations with sample data
-- Interactive calculator for testing conversions
-- Detailed output showing calculation steps
-
-### 3. Original RGBD Feed
-
-Run the original feed viewer:
-
-```bash
-python rgbd_feed.py
+### ArUco Settings
+```python
+self.aruco_marker_id = 0           # Marker ID
+self.aruco_marker_size = 0.04      # 4cm physical size
 ```
 
-### 4. Test AI Vision (Standalone)
+### Camera Calibration
+Automatic calibration from Record3D intrinsics. Manual override available in code.
 
-Test the vision analyzer independently:
+## Usage Examples
 
+### Manual Targeting
+1. Start application in Manual mode
+2. Hover mouse over objects to see 3D coordinates
+3. Left-click to send coordinates to robot
+4. Confirm robot movement when prompted
+
+### AI Object Detection
+1. Start application in AI Vision mode
+2. Describe target: "pick up the blue cup"
+3. AI analyzes frame and finds object
+4. Coordinates automatically sent to robot
+
+### Hybrid Workflow
+1. Start in Hybrid mode
+2. Use manual mode for precise positioning
+3. Press 'v' to switch to AI for object recognition
+4. Press 'm' to toggle between modes
+
+## Keyboard Controls
+
+- `q` - Quit application
+- `p` - Manual coordinate input (Manual/Hybrid mode)
+- `v` - AI vision analysis (Hybrid mode)
+- `m` - Toggle manual/AI modes (Hybrid mode)
+- `r` - Re-analyze with new task (AI mode)
+- `c` - Clear AI target (Hybrid mode)
+- `+/-` - Adjust ArUco marker size for debugging
+
+## Troubleshooting
+
+### ArUco Detection Issues
+- Ensure good lighting and contrast
+- Check marker is 4x4cm and ID 0
+- Verify marker is DICT_ARUCO_ORIGINAL type
+- Try adjusting marker size with +/- keys
+
+### Depth Accuracy
+- Ensure RGB and depth frames are aligned
+- Check for proper Record3D connection
+- Verify camera intrinsics are loaded
+
+### AI Vision Accuracy
+- Use specific object descriptions
+- Ensure objects are clearly visible
+- Good lighting improves detection
+- Bounding box visualization helps debug
+
+### Robot Communication
+- Verify robot endpoint URL
+- Check network connectivity
+- Confirm robot API is accessible
+- Test with curl commands
+
+## API Reference
+
+### VisionAnalyzer.analyze_image()
+```python
+result = analyzer.analyze_image(rgb_image, "target description", depth_frame)
+```
+
+Returns:
+```python
+{
+    "success": True,
+    "bbox": [x0, y0, x1, y1],
+    "target_pixel": [x, y], 
+    "confidence": 0.95,
+    "object_description": "found object",
+    "reasoning": "why these coordinates"
+}
+```
+
+### Coordinate Transformation
+```python
+# Pixel to 3D camera coordinates
+pos_3d = pixel_to_3d_position(u, v, depth, camera_matrix)
+
+# Camera to ArUco marker coordinates  
+marker_coords = pixel_to_marker_coordinates(rgb_x, rgb_y)
+
+# ArUco to robot coordinates
+robot_coords = convert_to_robot_frame(marker_coords)
+```
+
+## Development
+
+### Testing ArUco Detection
+```bash
+python aruco_rgbd_stream.py
+```
+
+### Generating Test Markers
+```bash
+python generate_aruco.py --help
+```
+
+### Vision System Testing
 ```bash
 python vision_analyzer.py test
 ```
 
-## AI Vision Examples
+## Contributing
 
-The AI vision system can identify objects using natural language descriptions:
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Add tests if applicable
+5. Submit a pull request
 
-**Simple Objects:**
-- "yellow banana"
-- "red apple" 
-- "coffee mug"
-- "water bottle"
+## License
 
-**Complex Descriptions:**
-- "the book with blue cover"
-- "red cup on the table"
-- "yellow banana on the left"
-- "the phone next to the laptop"
-- "green bottle in the center"
+MIT License - see LICENSE file for details.
 
-**Tips for Better Results:**
-- Be specific about colors, shapes, and positions
-- Use simple, clear descriptions
-- Objects should be clearly visible in the RGB frame
-- Good lighting improves detection accuracy
+## Acknowledgments
 
-## How 3D Position Calculation Works
-
-The conversion from 2D pixel coordinates to 3D positions uses the **pinhole camera model**:
-
-```
-X = (u - cx) * Z / fx
-Y = (v - cy) * Z / fy  
-Z = depth
-```
-
-Where:
-- `(u, v)` = pixel coordinates
-- `(cx, cy)` = principal point (camera center)
-- `fx, fy` = focal lengths
-- `Z` = depth value from RGBD sensor
-- `(X, Y, Z)` = 3D coordinates relative to camera
-
-## Camera Coordinate System
-
-- **X-axis**: Right (positive to the right)
-- **Y-axis**: Down (positive downward) 
-- **Z-axis**: Forward (positive away from camera)
-- **Origin**: Camera center
-
-## Example Output
-
-```
-Pixel (320, 240) -> Depth: 1.500m, 3D Position: (-0.156, -0.117, 1.500)
-
-============================================================
-3D POSITION CALCULATION RESULTS
-============================================================
-Input:
-  Pixel coordinates (u, v): (320, 240)
-  Depth: 1.500 meters
-
-Camera Intrinsic Parameters:
-  Focal length (fx): 1000.25
-  Focal length (fy): 1000.30
-  Principal point (cx): 640.12
-  Principal point (cy): 480.08
-
-Calculated 3D Position (relative to camera):
-  X: -0.156 meters
-  Y: -0.117 meters
-  Z: +1.500 meters
-  Distance from camera: 1.509 meters
-============================================================
-```
-
-## iPhone 13 Pro Setup
-
-1. Install **Record3D** app on your iPhone 13 Pro
-2. Connect both iPhone and computer to the same WiFi network
-3. Open Record3D app and start streaming
-4. Run the Python scripts on your computer
-
-## Code Structure
-
-### Main Application (`main.py`)
-
-```python
-from main import KinematicsApp
-
-app = KinematicsApp()
-app.connect_to_device(dev_idx=0)
-app.start_processing_stream()
-```
-
-### Utility Calculator (`position_calculator.py`)
-
-```python
-from position_calculator import Position3DCalculator
-
-calculator = Position3DCalculator()
-calculator.set_intrinsic_matrix(intrinsic_matrix)
-position_3d = calculator.pixel_to_3d(u, v, depth)
-```
-
-## Troubleshooting
-
-**Connection Issues:**
-- Ensure both devices are on the same WiFi network
-- Check that Record3D app is running and streaming
-- Try different device indices: `dev_idx=0, 1, 2...`
-
-**Invalid Depth Values:**
-- Some pixels may have no depth data (value = 0)
-- TrueDepth camera has limited range (~0.2m to 5m)
-- LiDAR has different characteristics than TrueDepth
-
-**Coordinate System:**
-- Remember that image coordinates (0,0) are at top-left
-- Depth array indexing is `depth[y, x]` (row, column)
-- 3D coordinates are in camera reference frame
-
-**AI Vision Issues:**
-- "Vision analyzer not available" → Check API key configuration
-- "Object not found" → Try different descriptions or better lighting
-- Slow response → Normal for first API call, subsequent calls are faster
-- Wrong object detected → Use more specific descriptions with colors/positions
-
-## Applications
-
-This system can be used for:
-- Object distance measurement
-- 3D reconstruction and mapping
-- Robotic navigation and manipulation
-- Augmented reality applications
-- Computer vision research
-
-## Technical Notes
-
-- **Intrinsic Matrix**: Automatically obtained from Record3D stream
-- **Depth Units**: Meters (from Record3D)
-- **Frame Rate**: Depends on iPhone model and settings
-- **Resolution**: Typically 640x480 for depth, higher for RGB
-- **Accuracy**: Limited by iPhone's depth sensor precision
-- **AI Vision Model**: Claude Sonnet 4 (requires internet connection)
-- **API Costs**: ~$0.001-0.01 per vision analysis (varies by image size) 
+- Record3D for iPhone RGBD streaming
+- OpenCV for computer vision capabilities  
+- Anthropic Claude for AI vision analysis
+- ArUco marker detection system 
