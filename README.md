@@ -61,9 +61,9 @@ pip install -r requirements.txt
 3. **Start Record3D** on your iPhone and connect to the same network.
 
 4. **Run the Application**
-   ```bash
-   python main.py
-   ```
+```bash
+python main.py
+```
 
 ## Operation Modes
 
